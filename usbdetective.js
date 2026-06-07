@@ -8,7 +8,7 @@
     Up/Down or j/k     Select USB devices/hubs in the topology tree
     PgUp/PgDn          Scroll details
     Left/Right         Previous/next detail tab
-    1..5               Select detail tab
+    1..6               Select detail tab
     r                  Refresh now
     q or Ctrl-C        Quit
 
@@ -77,7 +77,7 @@ let state = {
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
   leftRowMap: new Map(), lastPollAt: null
 };
-const tabs = ['Summary', '/dev', 'Driver', 'Kernel', 'Raw USB'];
+const tabs = ['Summary', '/dev', 'Handles', 'Driver', 'Kernel', 'Raw USB'];
 
 function parseLsusbLine(line) {
   const m = line.match(/^Bus\s+(\d+)\s+Device\s+(\d+):\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\s*(.*)$/);
@@ -134,6 +134,183 @@ async function lsLong(devPath) {
   const r = await run('ls', ['-l', devPath], { timeout: 2000 });
   return r.stdout || '';
 }
+
+async function readProcText(file, max = 65536) {
+  try {
+    const s = await fs.promises.readFile(file, 'utf8');
+    return s.slice(0, max);
+  } catch {
+    return '';
+  }
+}
+
+function parseUidFromStatus(statusText) {
+  const m = String(statusText || '').match(/^Uid:\s+(\d+)/m);
+  return m ? m[1] : '';
+}
+
+async function usernameFromUid(uid) {
+  if (!uid) return '';
+  const passwd = await readProcText('/etc/passwd', 1024 * 1024);
+  for (const line of passwd.split('\n')) {
+    const parts = line.split(':');
+    if (parts[2] === String(uid)) return parts[0];
+  }
+  return uid;
+}
+
+async function procInfo(pid) {
+  const base = `/proc/${pid}`;
+  const [comm, status, cmdlineRaw] = await Promise.all([
+    readProcText(`${base}/comm`, 4096),
+    readProcText(`${base}/status`, 65536),
+    fs.promises.readFile(`${base}/cmdline`).catch(() => Buffer.alloc(0))
+  ]);
+
+  const uid = parseUidFromStatus(status);
+  const user = await usernameFromUid(uid);
+  const cmdline = cmdlineRaw.length
+    ? cmdlineRaw.toString('utf8').replace(/\0/g, ' ').trim()
+    : '';
+
+  return {
+    pid: String(pid),
+    user,
+    command: (comm || '').trim(),
+    cmdline
+  };
+}
+
+async function scanProcOpeners(devPath) {
+  const out = [];
+  let devReal = devPath;
+  try { devReal = await fs.promises.realpath(devPath); } catch {}
+  let pids = [];
+  try {
+    pids = (await fs.promises.readdir('/proc')).filter(x => /^\d+$/.test(x));
+  } catch {
+    return out;
+  }
+
+  for (const pid of pids) {
+    const fdDir = `/proc/${pid}/fd`;
+    let fds = [];
+    try { fds = await fs.promises.readdir(fdDir); } catch { continue; }
+
+    const matchedFds = [];
+    for (const fd of fds) {
+      try {
+        const link = await fs.promises.readlink(`${fdDir}/${fd}`);
+        let resolved = link;
+        if (link.startsWith('/dev/')) {
+          try { resolved = await fs.promises.realpath(link); } catch {}
+        }
+        if (link === devPath || link === devReal || resolved === devReal) {
+          matchedFds.push({ fd, target: link });
+        }
+      } catch {}
+    }
+
+    if (matchedFds.length) {
+      const info = await procInfo(pid);
+      out.push({ ...info, fds: matchedFds, source: 'procfs' });
+    }
+  }
+
+  return out.sort((a, b) => Number(a.pid) - Number(b.pid));
+}
+
+async function lsofOpeners(devPath) {
+  const r = await run('lsof', ['-nP', '-F', 'pcuLftn', '--', devPath], { timeout: 2500, maxBuffer: 1024 * 1024 });
+  if (!r.ok || !r.stdout) return [];
+
+  const procs = [];
+  let cur = null;
+  let curFd = null;
+
+  for (const line of r.stdout.split('\n')) {
+    if (!line) continue;
+    const tag = line[0];
+    const val = line.slice(1);
+
+    if (tag === 'p') {
+      if (cur) procs.push(cur);
+      cur = { pid: val, command: '', user: '', login: '', fds: [], source: 'lsof' };
+      curFd = null;
+    } else if (!cur) {
+      continue;
+    } else if (tag === 'c') {
+      cur.command = val;
+    } else if (tag === 'u') {
+      cur.user = val;
+    } else if (tag === 'L') {
+      cur.login = val;
+    } else if (tag === 'f') {
+      curFd = { fd: val, type: '', target: '' };
+      cur.fds.push(curFd);
+    } else if (tag === 't' && curFd) {
+      curFd.type = val;
+    } else if (tag === 'n' && curFd) {
+      curFd.target = val;
+    }
+  }
+  if (cur) procs.push(cur);
+
+  for (const p of procs) {
+    const info = await procInfo(p.pid);
+    p.command = p.command || info.command;
+    p.user = p.login || p.user || info.user;
+    p.cmdline = info.cmdline;
+  }
+
+  return procs;
+}
+
+async function fuserOpeners(devPath) {
+  const r = await run('fuser', ['-v', devPath], { timeout: 2500, maxBuffer: 512 * 1024 });
+  return {
+    ok: r.ok,
+    stdout: r.stdout || '',
+    stderr: r.stderr || '',
+    available: !/not found|No such file/i.test(r.error + r.stderr)
+  };
+}
+
+async function getHandleUsers(devPath) {
+  const [lsof, procfs, fuser] = await Promise.all([
+    lsofOpeners(devPath).catch(() => []),
+    scanProcOpeners(devPath).catch(() => []),
+    fuserOpeners(devPath).catch(() => ({ ok:false, stdout:'', stderr:'', available:false }))
+  ]);
+
+  const byPid = new Map();
+  for (const p of [...lsof, ...procfs]) {
+    if (!p || !p.pid) continue;
+    const existing = byPid.get(p.pid) || {};
+    byPid.set(p.pid, {
+      ...existing,
+      ...p,
+      user: p.user || existing.user || '',
+      command: p.command || existing.command || '',
+      cmdline: p.cmdline || existing.cmdline || '',
+      fds: [...(existing.fds || []), ...(p.fds || [])],
+      source: [existing.source, p.source].filter(Boolean).join('+') || p.source || ''
+    });
+  }
+
+  const processes = [...byPid.values()].map(p => {
+    const seen = new Set();
+    p.fds = (p.fds || []).filter(fd => {
+      const k = `${fd.fd}|${fd.target || ''}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    return p;
+  }).sort((a, b) => Number(a.pid) - Number(b.pid));
+
+  return { processes, fuser };
+}
 async function getLsblkJson() {
   const r = await run('lsblk', ['-J','-o','NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,MODEL,SERIAL,TRAN,RM,MOUNTPOINTS'], { timeout: 3000, maxBuffer: 2 * 1024 * 1024 });
   try { return JSON.parse(r.stdout || '{}'); } catch { return {}; }
@@ -181,7 +358,7 @@ async function enrichDevice(dev, allNodes, blockMap) {
     const bd = busDevFromProps(props);
     const vp = vidPidFromProps(props);
     if (bd === dev.key || (!bd && vp === `${dev.vid}:${dev.pid}`) || (vp === `${dev.vid}:${dev.pid}` && path.basename(node).match(/^(ttyUSB|ttyACM|video|hidraw|event|sd|nvme)/))) {
-      matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node) });
+      matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node) });
     }
   }
   // Fallback: some tty nodes do not expose BUSNUM/DEVNUM, but do expose matching VID/PID.
@@ -189,7 +366,7 @@ async function enrichDevice(dev, allNodes, blockMap) {
     for (const node of allNodes) {
       const props = await udevProps(node);
       if (vidPidFromProps(props) === `${dev.vid}:${dev.pid}`) {
-        matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node) });
+        matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node) });
       }
     }
   }
@@ -676,6 +853,82 @@ function ensureSelectedVisible(rows, height) {
   if (state.leftScroll < 0) state.leftScroll = 0;
 }
 
+
+function shortCmd(p) {
+  return p.cmdline || p.command || '';
+}
+
+function handleDetailLines(d) {
+  const lines = [];
+  const activeNodes = d.devNodes || [];
+  lines.push(bold('Handles / open processes'), '');
+  lines.push('This shows the /dev nodes created for the selected USB device and any processes currently holding those nodes open.');
+  lines.push('Process detection uses lsof when available plus a /proc/*/fd scan fallback.');
+  lines.push('');
+
+  if (!activeNodes.length) {
+    lines.push('No /dev handles discovered for this USB device.');
+    lines.push('Root hubs and some internal devices often do not create user-facing /dev nodes.');
+    return lines;
+  }
+
+  let anyProcess = false;
+
+  for (const n of activeNodes) {
+    lines.push(bold(n.path));
+    lines.push(`  Type: ${n.type}`);
+    if (n.iface) lines.push(`  Interface: ${n.iface}`);
+    if (n.stat) lines.push(`  Node: ${n.stat}`);
+
+    const best = n.links.find(l => l.startsWith('/dev/serial/by-id/')) ||
+      n.links.find(l => l.startsWith('/dev/v4l/by-id/')) ||
+      n.links.find(l => l.startsWith('/dev/disk/by-id/')) ||
+      n.links[0];
+
+    if (best) lines.push(`  Stable name: ${best.split(' -> ')[0]}`);
+
+    const users = n.users || {};
+    const procs = users.processes || [];
+    if (!procs.length) {
+      lines.push('  Open by: none detected');
+      if (users.fuser && users.fuser.stderr && /Permission denied/i.test(users.fuser.stderr)) {
+        lines.push('  Note: process detection may need sudo for full visibility.');
+      }
+      lines.push('');
+      continue;
+    }
+
+    anyProcess = true;
+    lines.push('  Open by:');
+    lines.push('    PID       USER        COMMAND / FD');
+    for (const p of procs) {
+      const user = p.user || '?';
+      const cmd = shortCmd(p) || '?';
+      const fds = (p.fds || []).map(fd => `${fd.fd}${fd.type ? '/' + fd.type : ''}`).join(', ') || '?';
+      lines.push(`    ${rightPadRaw(p.pid, 9)} ${rightPadRaw(user, 11)} ${cmd}`);
+      lines.push(`              FD: ${fds}`);
+      if (p.source) lines.push(`              Found by: ${p.source}`);
+    }
+    lines.push('');
+  }
+
+  lines.push(bold('Notes'));
+  if (anyProcess) {
+    lines.push('  A listed process has the device node open right now. That can block serial ports, cameras, HID devices, or storage operations.');
+    lines.push('  Killing a process is intentionally not wired to a hotkey yet. Use the PID shown here with kill/killall after verifying it is safe.');
+  } else {
+    lines.push('  No process currently appears to hold these /dev handles open.');
+    lines.push('  Some kernel drivers claim USB interfaces without a user process keeping the /dev node open.');
+  }
+  lines.push('  Useful manual checks:');
+  for (const n of activeNodes) {
+    lines.push(`    lsof ${n.path}`);
+    lines.push(`    fuser -v ${n.path}`);
+  }
+
+  return lines;
+}
+
 function detailLines(d) {
   if (!d) return ['No USB devices found.'];
   const lines = [];
@@ -958,7 +1211,7 @@ function handleInput(buf) {
   if (s === '\x1b[5~') { scrollDetail(-10); return; }
   if (s === '\x1b[1;5B') { scrollLeft(5); return; }
   if (s === '\x1b[1;5A') { scrollLeft(-5); return; }
-  if (/^[1-5]$/.test(s)) { setTab(Number(s) - 1); return; }
+  if (/^[1-6]$/.test(s)) { setTab(Number(s) - 1); return; }
 
   // Mouse support is intentionally disabled. Terminal mouse coordinate reporting
   // varies enough between terminal emulators, font scaling, title bars, and pane
