@@ -25,7 +25,7 @@ USB Detective correlates information from:
 
 into a single terminal interface.
 
-![USB Detective](docs/usbdetective.png)
+![USB Detective](usbdetective.png)
 
 The interface is split into:
 
