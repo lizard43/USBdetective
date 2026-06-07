@@ -335,8 +335,6 @@ function topoSummaryForNode(t) {
   const bits = [];
   if (t.port) bits.push(`Port ${String(t.port).padStart(3, '0')}`);
   if (t.speed) bits.push(`Speed ${t.speed}`);
-  const drivers = topoDrivers(t);
-  if (drivers.length) bits.push(`Driver ${drivers.join('/')}`);
   return bits.join('  ');
 }
 
@@ -346,19 +344,25 @@ function devHandleSummary(d) {
   return `Handles ${count}`;
 }
 
-function deviceInfoLine(t, d) {
+function deviceInfoLines(t, d) {
   const id = d.vid && d.pid ? `${d.vid}:${d.pid}` : '????:????';
-  const bits = [`USB ${t.key}`, `ID ${id}`];
-  if (t.isRoot) bits.push('Root hub');
+
+  const identityBits = [`Bus ${t.bus}`, `Dev ${t.dev}`, `ID ${id}`];
+  if (t.isRoot) identityBits.push('Root hub');
   else {
-    const topo = topoSummaryForNode(t);
-    if (topo) bits.push(topo);
+    if (t.port) identityBits.push(`Port ${String(t.port).padStart(3, '0')}`);
+    if (t.speed) identityBits.push(`Speed ${t.speed}`);
   }
+
+  const softwareBits = [];
+  const drivers = topoDrivers(t);
+  if (drivers.length) softwareBits.push(`Driver ${drivers.join('/')}`);
   const classes = topoClasses(t).filter(c => c && !/root hub/i.test(c));
-  if (classes.length) bits.push(`Class ${classes.join('/')}`);
+  if (classes.length) softwareBits.push(`Class ${classes.join('/')}`);
   const handles = devHandleSummary(d);
-  if (handles) bits.push(handles);
-  return bits.join('  ');
+  if (handles) softwareBits.push(handles);
+
+  return [identityBits.join('  '), softwareBits.join('  ')];
 }
 
 function buildFallbackRows() {
@@ -379,16 +383,17 @@ function buildFallbackRows() {
         text:`${branch} ${d.name || '(unnamed USB device)'}`,
         selectable:true
       });
+      const nodes = (d.devNodes || []).map(n => n.path).sort();
+      const metaPrefix = childPrefix + (nodes.length ? '│  ' : '   ');
       rows.push({
         type:'meta',
         key:`${d.key}:meta`,
         selectKey:d.key,
         parentKey:d.key,
         device:d,
-        text:`${childPrefix}   USB ${d.key}  ID ${d.vid}:${d.pid}${d.devNodes && d.devNodes.length ? `  Handles ${d.devNodes.length}` : ''}`,
+        text:`${metaPrefix}Bus ${d.bus}  Dev ${d.dev}  ID ${d.vid}:${d.pid}${d.devNodes && d.devNodes.length ? `  Handles ${d.devNodes.length}` : ''}`,
         selectable:false
       });
-      const nodes = (d.devNodes || []).map(n => n.path).sort();
       nodes.forEach((n, j) => rows.push({
         type:'node',
         key:`${d.key}:${n}`,
@@ -540,6 +545,15 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
   });
 
   const childPrefix = prefix + (isLast ? '   ' : '│  ');
+  const children = t.children || [];
+  const nodes = (d.devNodes || []).map(n => n.path).sort();
+  const hasChildRows = children.length > 0 || nodes.length > 0;
+
+  // Metadata belongs to the selected USB device, but visually it should stay
+  // inside that device's branch. If the device has downstream children or /dev
+  // handles, keep an internal vertical pipe running through the metadata lines.
+  const metaPrefix = childPrefix + (hasChildRows ? '│  ' : '   ');
+  const infoLines = deviceInfoLines(t, d);
   rows.push({
     type:'meta',
     key:`${t.key}:meta`,
@@ -547,12 +561,21 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
     parentKey:t.key,
     device:d,
     topo:t,
-    text:`${childPrefix}   ${deviceInfoLine(t, d)}`,
+    text:`${metaPrefix}${infoLines[0]}`,
     selectable:false
   });
-
-  const children = t.children || [];
-  const nodes = (d.devNodes || []).map(n => n.path).sort();
+  if (infoLines[1]) {
+    rows.push({
+      type:'meta',
+      key:`${t.key}:meta2`,
+      selectKey:t.key,
+      parentKey:t.key,
+      device:d,
+      topo:t,
+      text:`${metaPrefix}${infoLines[1]}`,
+      selectable:false
+    });
+  }
 
   children.forEach((c, i) => {
     const childIsLast = i === children.length - 1 && nodes.length === 0;
