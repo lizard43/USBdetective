@@ -1,121 +1,107 @@
 #!/usr/bin/env node
 /*
-  usbdetective.js - file-explorer style USB detective TUI for Linux
+  usbdetective.js - USB topology TUI for Linux Mint
 
-  Design reset:
-    - No incident history dump.
-    - Polls current USB state and renders a two-pane explorer.
-    - Left pane lists USB bus devices plus matching /dev nodes.
-    - Right pane shows details for the selected device.
-    - New devices are highlighted briefly.
-    - Keyboard and basic mouse click selection.
+  No npm dependencies. Uses lsusb, udevadm, lsblk, dmesg, and optional v4l2-ctl.
 
   Keys:
-    up/down or j/k  select device
-    pageup/pagedown scroll device list
-    r               refresh now
-    d               toggle raw details
-    m               toggle kernel clues
-    q or Ctrl-C     quit
+    Up/Down or j/k     Select device
+    PgUp/PgDn          Scroll details
+    [ / ]              Previous/next detail tab
+    1..6               Select detail tab
+    r                  Refresh now
+    q or Ctrl-C        Quit
+
+  Mouse:
+    Click left pane rows to select
+    Wheel scrolls details
 
   Env:
-    USB_DETECTIVE_POLL_MS=1500
+    USB_DETECTIVE_POLL_MS=1000
     USB_DETECTIVE_COLOR=0
+    USB_DETECTIVE_KEEP_REMOVED_MS=4500
+    USB_DETECTIVE_HIGHLIGHT_MS=5000
 */
 
 const { execFile } = require('child_process');
-const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
-const POLL_MS = Math.max(500, Number(process.env.USB_DETECTIVE_POLL_MS || 1500));
+const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
+const KEEP_REMOVED_MS = Number(process.env.USB_DETECTIVE_KEEP_REMOVED_MS || 4500);
+const HIGHLIGHT_MS = Number(process.env.USB_DETECTIVE_HIGHLIGHT_MS || 5000);
 const USE_COLOR = process.env.USB_DETECTIVE_COLOR !== '0' && process.stdout.isTTY;
-const NEW_MS = 6000;
 
 const C = {
-  reset: '\x1b[0m', bold: '\x1b[1m', rev: '\x1b[7m',
-  black: '\x1b[30m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m',
-  blue: '\x1b[34m', magenta: '\x1b[35m', cyan: '\x1b[36m', white: '\x1b[37m',
-  bgWhite: '\x1b[47m', bgCyan: '\x1b[46m'
+  reset:'\x1b[0m', bold:'\x1b[1m', rev:'\x1b[7m',
+  red:'\x1b[31m', green:'\x1b[32m', yellow:'\x1b[33m', cyan:'\x1b[36m', white:'\x1b[37m',
+  bgBlue:'\x1b[44m', bgRed:'\x1b[41m', bgGreen:'\x1b[42m', black:'\x1b[30m'
 };
-const cc = (name, s) => USE_COLOR ? `${C[name] || ''}${s}${C.reset}` : s;
-const bold = s => cc('bold', s);
-const cyan = s => cc('cyan', s);
-const green = s => cc('green', s);
-const yellow = s => cc('yellow', s);
-const selected = s => USE_COLOR ? `${C.black}${C.bgWhite}${s}${C.reset}` : `> ${s}`;
-
-let state = {
-  devices: [],
-  selectedIndex: 0,
-  leftScroll: 0,
-  rightScroll: 0,
-  showRaw: false,
-  showKernel: true,
-  lastScan: '',
-  status: 'Starting...',
-  previousKeys: new Set(),
-  newUntil: new Map(),
-};
-
-let rendering = false;
-let lastFrame = '';
-let pollBusy = false;
-let pollTimer = null;
+function color(code, s) { return USE_COLOR ? code + s + C.reset : s; }
+function bold(s) { return color(C.bold, s); }
+function green(s) { return color(C.green + C.bold, s); }
+function red(s) { return color(C.red + C.bold, s); }
+function yellow(s) { return color(C.yellow + C.bold, s); }
+function cyan(s) { return color(C.cyan + C.bold, s); }
+function selected(s) { return USE_COLOR ? C.bgBlue + C.white + C.bold + s + C.reset : '>' + s.slice(1); }
+function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, ''); }
+function visLen(s) { return stripAnsi(s).length; }
+function pad(s, width) { const n = visLen(s); return n >= width ? trunc(s, width) : s + ' '.repeat(width - n); }
+function trunc(s, width) {
+  const raw = stripAnsi(s);
+  if (raw.length <= width) return s;
+  return raw.slice(0, Math.max(0, width - 1)) + '…';
+}
+function rightPadRaw(s, width) { s = String(s || ''); return s.length >= width ? s.slice(0, width) : s + ' '.repeat(width - s.length); }
+function shellQuote(s) { return `'${String(s).replace(/'/g, `'"'"'`)}'`; }
 
 function run(cmd, args = [], opts = {}) {
   return new Promise(resolve => {
     execFile(cmd, args, {
-      timeout: opts.timeout || 5000,
-      maxBuffer: opts.maxBuffer || 4 * 1024 * 1024,
-      shell: false,
+      timeout: opts.timeout || 4000,
+      maxBuffer: opts.maxBuffer || 1024 * 1024,
+      shell: false
     }, (err, stdout, stderr) => {
-      resolve({
-        ok: !err,
-        stdout: (stdout || '').trim(),
-        stderr: (stderr || '').trim(),
-        error: err ? String(err.message || err) : '',
-      });
+      resolve({ ok: !err, stdout: (stdout || '').trim(), stderr: (stderr || '').trim(), error: err ? String(err.message || err) : '' });
     });
   });
 }
-function sh(command, opts = {}) { return run('bash', ['-lc', command], opts); }
-function shellQuote(s) { return `'${String(s).replace(/'/g, `'"'"'`)}'`; }
+async function sh(command, opts = {}) { return run('bash', ['-lc', command], opts); }
 
-function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ''); }
-function visibleLen(s) { return stripAnsi(s).length; }
-function padAnsi(s, width) {
-  const len = visibleLen(s);
-  if (len >= width) return truncAnsi(s, width);
-  return s + ' '.repeat(width - len);
-}
-function truncAnsi(s, width) {
-  const plain = stripAnsi(s);
-  if (plain.length <= width) return s;
-  if (width <= 1) return plain.slice(0, width);
-  return plain.slice(0, width - 1) + '…';
-}
-function cleanUsbString(s) {
-  return String(s || '').replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
-}
+let state = {
+  devices: [], rows: [], selectedKey: null, selectedIndex: 0, detailScroll: 0, tab: 0,
+  previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
+  lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
+  leftRowMap: new Map(), lastPollAt: null
+};
+const tabs = ['Summary', '/dev', 'Topology', 'Driver', 'Kernel', 'Raw USB'];
 
 function parseLsusbLine(line) {
   const m = line.match(/^Bus\s+(\d+)\s+Device\s+(\d+):\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\s*(.*)$/);
   if (!m) return null;
-  return {
-    bus: m[1], devnum: m[2], vid: m[3].toLowerCase(), pid: m[4].toLowerCase(), desc: (m[5] || '').trim(),
-    busNode: `/dev/bus/usb/${m[1]}/${m[2]}`,
-  };
+  const [, bus, dev, vid, pid, name] = m;
+  return { bus, dev, vid: vid.toLowerCase(), pid: pid.toLowerCase(), name: (name || '').trim(), key: `${bus}:${dev}`, devNodes: [], links: [], props: {}, block: null, videoInfo: '', rawUsb: '', removed: false };
 }
-
-async function getUsbBusDevices() {
-  const r = await run('lsusb');
-  return (r.stdout || '').split('\n').map(parseLsusbLine).filter(Boolean);
+async function getLsusbDevices() {
+  const r = await run('lsusb', [], { timeout: 3000 });
+  return (r.stdout || '').split('\n').map(parseLsusbLine).filter(Boolean)
+    .sort((a,b) => a.bus.localeCompare(b.bus) || Number(a.dev) - Number(b.dev));
 }
-
-async function getUdevProps(devPath) {
-  if (!devPath || !fs.existsSync(devPath)) return {};
-  const r = await run('udevadm', ['info', '--query=property', '--name', devPath], { timeout: 4000, maxBuffer: 1024 * 1024 });
+async function getLsusbTree() {
+  const r = await run('lsusb', ['-t'], { timeout: 3000, maxBuffer: 1024 * 1024 });
+  return r.stdout || '';
+}
+async function getDmesgTail() {
+  const r = await sh('dmesg --time-format=iso 2>/dev/null | tail -120', { timeout: 3000, maxBuffer: 1024 * 1024 });
+  return (r.stdout || '').split('\n').filter(l => /usb|ttyUSB|ttyACM|cdc_acm|ch341|ch34|ftdi|cp210|pl2303|hid|input|video|uvc|storage|scsi|sd[a-z]|disconnect/i.test(l)).slice(-60);
+}
+async function getDevCandidates() {
+  const cmd = `for p in /dev/ttyUSB* /dev/ttyACM* /dev/video* /dev/hidraw* /dev/sd* /dev/nvme* /dev/input/event*; do [ -e "$p" ] && echo "$p"; done | sort -V`;
+  const r = await sh(cmd, { timeout: 3000, maxBuffer: 1024 * 1024 });
+  return (r.stdout || '').split('\n').map(s => s.trim()).filter(Boolean);
+}
+async function udevProps(devPath) {
+  const r = await run('udevadm', ['info', '--query=property', '--name', devPath], { timeout: 3000, maxBuffer: 512 * 1024 });
   const props = {};
   for (const line of (r.stdout || '').split('\n')) {
     const i = line.indexOf('=');
@@ -123,355 +109,352 @@ async function getUdevProps(devPath) {
   }
   return props;
 }
-
-async function getDevCandidates() {
-  const cmd = `
-    for p in /dev/ttyUSB* /dev/ttyACM* /dev/video* /dev/hidraw* /dev/input/event* /dev/sd* /dev/nvme* /dev/bus/usb/*/*; do
-      [ -e "$p" ] && printf '%s\n' "$p"
-    done | sort -u
-  `;
-  const r = await sh(cmd, { timeout: 4000 });
-  return (r.stdout || '').split('\n').map(s => s.trim()).filter(Boolean);
+async function symlinkMatches(devPath) {
+  const real = await fs.promises.realpath(devPath).catch(() => devPath);
+  const dirs = ['/dev/serial/by-id','/dev/serial/by-path','/dev/disk/by-id','/dev/disk/by-label','/dev/disk/by-uuid','/dev/v4l/by-id','/dev/v4l/by-path'];
+  const out = [];
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
+    let names = [];
+    try { names = await fs.promises.readdir(dir); } catch { continue; }
+    for (const name of names) {
+      const link = path.join(dir, name);
+      try {
+        const target = await fs.promises.realpath(link);
+        if (target === real) out.push(`${link} -> ${await fs.promises.readlink(link)}`);
+      } catch {}
+    }
+  }
+  return out.sort();
 }
-
-async function getSymlinks() {
-  const cmd = `
-    for d in /dev/serial/by-id /dev/serial/by-path /dev/v4l/by-id /dev/v4l/by-path /dev/disk/by-id /dev/disk/by-label /dev/disk/by-uuid; do
-      [ -d "$d" ] || continue
-      find "$d" -maxdepth 1 -type l -printf '%p -> %l\n' 2>/dev/null
-    done
-  `;
-  const r = await sh(cmd, { timeout: 4000, maxBuffer: 1024 * 1024 });
+async function lsLong(devPath) {
+  const r = await run('ls', ['-l', devPath], { timeout: 2000 });
+  return r.stdout || '';
+}
+async function getLsblkJson() {
+  const r = await run('lsblk', ['-J','-o','NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,MODEL,SERIAL,TRAN,RM,MOUNTPOINTS'], { timeout: 3000, maxBuffer: 2 * 1024 * 1024 });
+  try { return JSON.parse(r.stdout || '{}'); } catch { return {}; }
+}
+function flattenBlock(tree, arr = []) {
+  for (const d of tree.blockdevices || []) walkBlock(d, arr);
+  return arr;
+}
+function walkBlock(d, arr) { arr.push(d); for (const c of d.children || []) walkBlock(c, arr); }
+function busDevFromProps(props) {
+  let bus = props.BUSNUM || props.ID_BUSNUM || '';
+  let dev = props.DEVNUM || props.ID_DEVNUM || '';
+  if (bus && dev) return `${String(bus).padStart(3,'0')}:${String(dev).padStart(3,'0')}`;
+  return '';
+}
+function vidPidFromProps(props) {
+  const vid = (props.ID_VENDOR_ID || '').toLowerCase();
+  const pid = (props.ID_MODEL_ID || '').toLowerCase();
+  return vid && pid ? `${vid}:${pid}` : '';
+}
+function classifyDevNode(devPath, props) {
+  const base = path.basename(devPath);
+  if (/^ttyUSB\d+$/.test(base)) return 'USB serial adapter';
+  if (/^ttyACM\d+$/.test(base)) return 'CDC/ACM serial device';
+  if (/^video\d+$/.test(base)) return 'Video/camera node';
+  if (/^hidraw\d+$/.test(base)) return 'HID raw node';
+  if (/^event\d+$/.test(base)) return 'Input event node';
+  if (/^sd[a-z]\d*$/.test(base) || /^nvme\d+n\d+(p\d+)?$/.test(base)) return 'Storage/block node';
+  if (props.ID_INPUT) return 'Input/HID node';
+  return 'Device node';
+}
+function interfaceLabel(props) {
+  const n = props.ID_USB_INTERFACE_NUM;
+  if (n === '00') return 'Channel A / interface 0';
+  if (n === '01') return 'Channel B / interface 1';
+  if (n === '02') return 'Channel C / interface 2';
+  if (n === '03') return 'Channel D / interface 3';
+  const m = String(props.DEVPATH || '').match(/:(\d+)\.(\d+)(?:\/|$)/);
+  return m ? `USB config ${m[1]} interface ${m[2]}` : '';
+}
+async function enrichDevice(dev, allNodes, blockMap) {
+  const matches = [];
+  for (const node of allNodes) {
+    const props = await udevProps(node);
+    const bd = busDevFromProps(props);
+    const vp = vidPidFromProps(props);
+    if (bd === dev.key || (!bd && vp === `${dev.vid}:${dev.pid}`) || (vp === `${dev.vid}:${dev.pid}` && path.basename(node).match(/^(ttyUSB|ttyACM|video|hidraw|event|sd|nvme)/))) {
+      matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node) });
+    }
+  }
+  // Fallback: some tty nodes do not expose BUSNUM/DEVNUM, but do expose matching VID/PID.
+  if (!matches.length) {
+    for (const node of allNodes) {
+      const props = await udevProps(node);
+      if (vidPidFromProps(props) === `${dev.vid}:${dev.pid}`) {
+        matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node) });
+      }
+    }
+  }
+  dev.devNodes = matches;
+  for (const m of matches) {
+    const b = blockMap.get(m.path);
+    if (b) m.block = b;
+  }
+  return dev;
+}
+async function collectSnapshot() {
+  const [devices, tree, devNodes, lsblk, kernel] = await Promise.all([getLsusbDevices(), getLsusbTree(), getDevCandidates(), getLsblkJson(), getDmesgTail()]);
+  const blockMap = new Map(flattenBlock(lsblk).filter(d => d.path).map(d => [d.path, d]));
+  for (const d of devices) await enrichDevice(d, devNodes, blockMap);
+  return { devices, tree, kernel, when: new Date() };
+}
+function updateHighlights(newDevices) {
+  const now = Date.now();
+  const newKeys = new Set(newDevices.map(d => d.key));
+  for (const d of newDevices) {
+    if (!state.previousKeys.has(d.key) && state.previousKeys.size) state.addedUntil.set(d.key, now + HIGHLIGHT_MS);
+  }
+  for (const oldKey of state.previousKeys) {
+    if (!newKeys.has(oldKey)) {
+      const old = state.devices.find(d => d.key === oldKey) || state.removedDevices.get(oldKey);
+      if (old) {
+        const copy = { ...old, removed: true, removedAt: now, devNodes: old.devNodes || [] };
+        state.removedDevices.set(oldKey, copy);
+        state.removedUntil.set(oldKey, now + KEEP_REMOVED_MS);
+      }
+    }
+  }
+  for (const [k, t] of [...state.addedUntil]) if (t <= now) state.addedUntil.delete(k);
+  for (const [k, t] of [...state.removedUntil]) if (t <= now) { state.removedUntil.delete(k); state.removedDevices.delete(k); }
+  state.previousKeys = newKeys;
+}
+function mergedDevices(devices) {
+  const out = [...devices];
+  for (const [k, d] of state.removedDevices) if (!devices.some(x => x.key === k)) out.push(d);
+  return out.sort((a,b) => a.bus.localeCompare(b.bus) || Number(a.dev) - Number(b.dev));
+}
+function signature(snap) {
+  return JSON.stringify({ d: snap.devices.map(d => [d.key, d.vid, d.pid, d.name, d.devNodes.map(n => n.path).sort()]), r: [...state.removedDevices.keys()].sort(), tab: state.tab, sel: state.selectedKey, scroll: state.detailScroll, size: termSize() });
+}
+async function poll(force = false) {
+  if (state.polling) return;
+  state.polling = true;
+  try {
+    const snap = await collectSnapshot();
+    updateHighlights(snap.devices);
+    state.devices = mergedDevices(snap.devices);
+    state.tree = snap.tree;
+    state.lastKernel = snap.kernel;
+    state.lastPollAt = snap.when;
+    if (!state.selectedKey || !state.devices.some(d => d.key === state.selectedKey)) {
+      state.selectedKey = state.devices[0] ? state.devices[0].key : null;
+      state.selectedIndex = 0;
+      state.detailScroll = 0;
+    } else {
+      state.selectedIndex = Math.max(0, state.devices.findIndex(d => d.key === state.selectedKey));
+    }
+    state.status = `Updated ${snap.when.toLocaleTimeString()}  |  ${snap.devices.length} active USB devices`;
+    const sig = signature(snap);
+    if (force || sig !== state.lastSignature) { state.lastSignature = sig; render(); }
+  } catch (e) {
+    state.status = `Error: ${e.message || e}`;
+    render();
+  } finally { state.polling = false; }
+}
+function selectedDevice() { return state.devices.find(d => d.key === state.selectedKey) || state.devices[0] || null; }
+function deviceLabel(d) {
+  const devs = (d.devNodes || []).map(n => n.path.replace('/dev/', '')).sort();
+  const name = d.name || '(unnamed USB device)';
+  const devText = devs.length ? `  /dev: ${devs.join(', ')}` : '';
+  return `${d.key} ${d.vid}:${d.pid} ${name}${devText}`;
+}
+function buildRows() {
   const rows = [];
-  for (const line of (r.stdout || '').split('\n')) {
-    const i = line.indexOf(' -> ');
-    if (i < 0) continue;
-    const link = line.slice(0, i);
-    try { rows.push({ link, real: fs.realpathSync(link), text: line }); } catch {}
+  const buses = [...new Set(state.devices.map(d => d.bus))].sort();
+  for (const bus of buses) {
+    rows.push({ type:'bus', key:`bus:${bus}`, text:`USB Bus ${bus}`, selectable:false });
+    const list = state.devices.filter(d => d.bus === bus).sort((a,b) => Number(a.dev) - Number(b.dev));
+    list.forEach((d, i) => {
+      const branch = i === list.length - 1 ? '└─' : '├─';
+      rows.push({ type:'dev', key:d.key, device:d, text:`${branch} ${deviceLabel(d)}`, selectable:true });
+      const nodes = (d.devNodes || []).map(n => n.path).sort();
+      nodes.forEach((n, j) => rows.push({ type:'node', key:`${d.key}:${n}`, parentKey:d.key, text:`${i === list.length - 1 ? '   ' : '│  '} ${j === nodes.length - 1 ? '└' : '├'} /dev/${path.basename(n)}`, selectable:false }));
+    });
   }
   return rows;
 }
-
-async function getLsusbTree() {
-  const r = await run('lsusb', ['-t'], { timeout: 4000 });
-  return r.stdout || '';
-}
-
-async function getDmesgRecent() {
-  const r = await sh('dmesg --time-format=iso 2>/dev/null | tail -120', { timeout: 5000, maxBuffer: 2 * 1024 * 1024 });
-  return (r.stdout || '').split('\n').filter(Boolean);
-}
-
-function devKind(devPath, props = {}) {
-  const b = path.basename(devPath);
-  if (/^ttyUSB\d+$/.test(b)) return 'serial';
-  if (/^ttyACM\d+$/.test(b)) return 'cdc-acm';
-  if (/^video\d+$/.test(b)) return 'video';
-  if (/^hidraw\d+$/.test(b)) return 'hidraw';
-  if (/^event\d+$/.test(b)) return 'input';
-  if (/^sd[a-z]\d*$/.test(b) || /^nvme/.test(b)) return 'storage';
-  if (devPath.startsWith('/dev/bus/usb/')) return 'usb-bus';
-  return props.SUBSYSTEM || 'dev';
-}
-
-function interfaceLabel(props = {}) {
-  const n = props.ID_USB_INTERFACE_NUM;
-  if (n === '00') return 'A/if00';
-  if (n === '01') return 'B/if01';
-  if (n === '02') return 'C/if02';
-  if (n === '03') return 'D/if03';
-  const m = String(props.DEVPATH || '').match(/:(\d+)\.(\d+)(?:\/|$)/);
-  if (m) return `if${m[2]}`;
-  return '';
-}
-
-function matchesUsbDevice(usb, props, devPath) {
-  const vid = String(props.ID_VENDOR_ID || '').toLowerCase();
-  const pid = String(props.ID_MODEL_ID || '').toLowerCase();
-  if (vid === usb.vid && pid === usb.pid) {
-    // Prefer exact bus node for /dev/bus; for tty/video udev generally has matching VID:PID.
-    return true;
-  }
-  if (devPath === usb.busNode) return true;
-  return false;
-}
-
-async function buildModel() {
-  const [usbList, devPaths, syms, tree, dmesg] = await Promise.all([
-    getUsbBusDevices(), getDevCandidates(), getSymlinks(), getLsusbTree(), getDmesgRecent()
-  ]);
-
-  const devObjs = [];
-  for (const p of devPaths) {
-    const props = await getUdevProps(p);
-    const links = syms.filter(s => s.real === p).map(s => s.link);
-    devObjs.push({ path: p, props, links, kind: devKind(p, props), iface: interfaceLabel(props) });
-  }
-
-  const devices = usbList.map(usb => {
-    const matches = devObjs.filter(d => matchesUsbDevice(usb, d.props, d.path));
-    const busDev = devObjs.find(d => d.path === usb.busNode) || { path: usb.busNode, props: {}, links: [], kind: 'usb-bus', iface: '' };
-    if (!matches.find(d => d.path === usb.busNode) && fs.existsSync(usb.busNode)) matches.unshift(busDev);
-    const bestProps = matches.find(d => d.props.ID_MODEL || d.props.ID_VENDOR || d.props.ID_MODEL_FROM_DATABASE) || busDev;
-    const props = bestProps.props || {};
-    const vendor = cleanUsbString(props.ID_VENDOR_FROM_DATABASE || props.ID_VENDOR || usb.desc.split(/\s{2,}/)[0] || '');
-    const model = cleanUsbString(props.ID_MODEL_FROM_DATABASE || props.ID_MODEL || usb.desc || 'USB device');
-    const name = cleanUsbString(usb.desc || `${vendor} ${model}` || `${usb.vid}:${usb.pid}`);
-    return {
-      key: `${usb.bus}:${usb.devnum}:${usb.vid}:${usb.pid}`,
-      usb, name, vendor, model, props,
-      devs: matches.sort((a, b) => a.path.localeCompare(b.path)),
-      tree, dmesg,
-    };
-  });
-
-  return devices;
-}
-
-function majorDevNames(devs) {
-  const useful = devs
-    .map(d => path.basename(d.path))
-    .filter(b => /^(ttyUSB|ttyACM|video|hidraw|event|sd|nvme)/.test(b));
-  return [...new Set(useful)].join(', ');
-}
-
-function listLine(dev, width, idx, selectedIdx) {
-  const isNew = state.newUntil.get(dev.key) && Date.now() < state.newUntil.get(dev.key);
-  const devNames = majorDevNames(dev.devs);
-  let first = `${idx === selectedIdx ? '▶' : ' '} ${dev.usb.bus}:${dev.usb.devnum} ${dev.usb.vid}:${dev.usb.pid}`;
-  if (devNames) first += `  /dev: ${devNames}`;
-  if (isNew) first += '  NEW';
-  let second = `   ${dev.name}`;
-  if (isNew) { first = green(bold(first)); second = green(bold(second)); }
-  if (idx === selectedIdx) first = selected(padAnsi(first, width));
-  return [padAnsi(first, width), padAnsi(second, width)];
-}
-
-function detailLines(dev, width) {
-  if (!dev) return ['No USB devices found.'];
+function detailLines(d) {
+  if (!d) return ['No USB devices found.'];
   const lines = [];
-  const add = s => lines.push(truncAnsi(s, width));
-  const kv = (k, v) => { if (v) add(`${bold(k.padEnd(13))} ${v}`); };
-  const props = dev.props || {};
-
-  add(bold(dev.name));
-  add(`${cyan('USB')} Bus ${dev.usb.bus} Device ${dev.usb.devnum}  ID ${dev.usb.vid}:${dev.usb.pid}`);
-  add('');
-  add(bold('Summary'));
-  kv('Vendor', cleanUsbString(props.ID_VENDOR_FROM_DATABASE || props.ID_VENDOR || dev.vendor));
-  kv('Model', cleanUsbString(props.ID_MODEL_FROM_DATABASE || props.ID_MODEL || dev.model));
-  kv('Serial', props.ID_SERIAL_SHORT || props.ID_SERIAL);
-  kv('Driver', props.ID_USB_DRIVER || props.DRIVER || 'usb');
-  kv('Subsystem', props.SUBSYSTEM || 'usb');
-  kv('USB path', props.ID_PATH);
-  kv('Bus node', dev.usb.busNode);
-
-  add('');
-  add(bold(`Matching /dev nodes (${dev.devs.length})`));
-  if (!dev.devs.length) add('No matching /dev nodes. This may be a hub, receiver, keyboard, or raw USB-only device.');
-  for (const d of dev.devs) {
-    const iface = d.iface ? ` (${d.iface})` : '';
-    add(`${green('●')} ${bold(d.path)}${iface}`);
-    add(`   type     ${d.kind}`);
-    if (d.props.ID_USB_DRIVER || d.props.DRIVER) add(`   driver   ${d.props.ID_USB_DRIVER || d.props.DRIVER}`);
-    if (d.props.ID_SERIAL_SHORT || d.props.ID_SERIAL) add(`   serial   ${d.props.ID_SERIAL_SHORT || d.props.ID_SERIAL}`);
-    if (d.links.length) add(`   symlink  ${d.links[0]}`);
-  }
-
-  add('');
-  add(bold('Practical handles'));
-  const serial = dev.devs.filter(d => /^\/dev\/tty(USB|ACM)\d+$/.test(d.path));
-  const video = dev.devs.filter(d => /^\/dev\/video\d+$/.test(d.path));
-  const storage = dev.devs.filter(d => /^\/dev\/(sd[a-z]|nvme)/.test(d.path));
-  if (serial.length) {
-    for (const d of serial) add(`serial   ${d.links.find(l => l.includes('/by-id/')) || d.path}`);
-  }
-  if (video.length) {
-    for (const d of video) add(`camera   ${d.links.find(l => l.includes('/by-id/')) || d.path}`);
-  }
-  if (storage.length) {
-    for (const d of storage) add(`storage  ${d.path}`);
-  }
-  if (!serial.length && !video.length && !storage.length) add('No serial/video/storage handles. Use bus node or inspect HID/input nodes if present.');
-
-  if (state.showKernel) {
-    add('');
-    add(bold('Kernel clues'));
-    const terms = [dev.usb.vid, dev.usb.pid, dev.usb.devnum.replace(/^0+/, ''), props.ID_SERIAL_SHORT, props.ID_MODEL, props.ID_VENDOR]
-      .filter(Boolean).map(s => String(s).replace(/_/g, ' '));
-    const clue = dev.dmesg.filter(l => terms.some(t => t && l.toLowerCase().includes(t.toLowerCase())) ||
-      (props.ID_PATH && l.includes(props.ID_PATH.split('-usb-').pop()?.split(':')[0] || '---'))).slice(-16);
-    if (clue.length) clue.forEach(add); else add('No recent matching kernel clues.');
-  }
-
-  if (state.showRaw) {
-    add('');
-    add(bold('Raw udev properties'));
-    Object.keys(props).sort().forEach(k => add(`${k}=${props[k]}`));
-    add('');
-    add(bold('lsusb -t'));
-    dev.tree.split('\n').forEach(add);
+  const activeNodes = d.devNodes || [];
+  const header = `${d.key}  ${d.vid}:${d.pid}  ${d.name || '(unnamed)'}`;
+  if (state.tab === 0) {
+    lines.push(bold(header), '');
+    lines.push(`Status: ${d.removed ? red('recently unplugged') : 'active'}`);
+    lines.push(`Bus: ${d.bus}`);
+    lines.push(`Device number: ${d.dev}`);
+    lines.push(`Vendor/Product ID: ${d.vid}:${d.pid}`);
+    lines.push(`Name: ${d.name || ''}`);
+    lines.push('');
+    lines.push(bold('Detected /dev handles'));
+    if (activeNodes.length) for (const n of activeNodes) lines.push(`  ${n.path}  ${n.iface ? '(' + n.iface + ')' : ''}  ${n.type}`);
+    else lines.push('  None found. Root hubs and some internal devices may not create user-facing /dev nodes.');
+    lines.push('');
+    lines.push(bold('Likely next step'));
+    lines.push(...suggestions(d));
+  } else if (state.tab === 1) {
+    lines.push(bold('/dev nodes and stable names'), '');
+    if (!activeNodes.length) lines.push('No matching /dev nodes discovered for this USB device.');
+    for (const n of activeNodes) {
+      lines.push(bold(n.path));
+      lines.push(`  Type: ${n.type}`);
+      if (n.iface) lines.push(`  Interface: ${n.iface}`);
+      if (n.stat) lines.push(`  Node: ${n.stat}`);
+      const best = n.links.find(l => l.startsWith('/dev/serial/by-id/')) || n.links.find(l => l.startsWith('/dev/v4l/by-id/')) || n.links.find(l => l.startsWith('/dev/disk/by-id/')) || n.links[0];
+      if (best) lines.push(`  Best stable name: ${best.split(' -> ')[0]}`);
+      if (n.links.length) { lines.push('  Symlinks:'); for (const l of n.links) lines.push(`    ${l}`); }
+      if (n.block) lines.push(`  Block: ${n.block.type || ''} ${n.block.size || ''} ${n.block.fstype || ''} ${n.block.label || ''} ${(n.block.mountpoints || []).filter(Boolean).join(',')}`);
+      lines.push('');
+    }
+  } else if (state.tab === 2) {
+    lines.push(bold('USB topology from lsusb -t'), '');
+    lines.push(...(state.tree || '').split('\n'));
+  } else if (state.tab === 3) {
+    lines.push(bold('Driver / udev properties'), '');
+    if (!activeNodes.length) lines.push('No /dev-backed udev properties found for this device.');
+    for (const n of activeNodes) {
+      lines.push(bold(n.path));
+      const keys = ['SUBSYSTEM','DEVTYPE','ID_BUS','ID_USB_DRIVER','DRIVER','ID_VENDOR','ID_VENDOR_FROM_DATABASE','ID_VENDOR_ID','ID_MODEL','ID_MODEL_FROM_DATABASE','ID_MODEL_ID','ID_SERIAL','ID_SERIAL_SHORT','ID_USB_INTERFACE_NUM','ID_PATH','DEVPATH','TAGS'];
+      for (const k of keys) if (n.props[k]) lines.push(`  ${rightPadRaw(k, 24)} ${n.props[k]}`);
+      lines.push('');
+    }
+  } else if (state.tab === 4) {
+    lines.push(bold('Recent relevant kernel clues'), '');
+    const relevant = state.lastKernel.filter(l => l.includes(`${Number(d.bus)}-`) || l.toLowerCase().includes((d.name || '').split(' ')[0]?.toLowerCase() || '___') || /usb|ttyUSB|ttyACM|disconnect|attached/i.test(l)).slice(-50);
+    if (!relevant.length) lines.push('No recent matching kernel lines in dmesg tail.');
+    else lines.push(...relevant);
+  } else if (state.tab === 5) {
+    lines.push(bold(`Raw USB descriptor excerpt: lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`), '');
+    lines.push('Press r to refresh. This tab loads on demand in the next version; current useful raw command:');
+    lines.push(`  lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`);
+    lines.push('');
+    lines.push('Basic identity:');
+    lines.push(`  Bus ${d.bus} Device ${d.dev}: ID ${d.vid}:${d.pid} ${d.name}`);
   }
   return lines;
 }
-
-function layout() {
-  const cols = process.stdout.columns || 120;
-  const rows = process.stdout.rows || 35;
-  const leftW = Math.max(36, Math.min(58, Math.floor(cols * 0.34)));
-  const rightW = Math.max(20, cols - leftW - 4);
-  const bodyH = Math.max(8, rows - 4);
-  return { cols, rows, leftW, rightW, bodyH };
-}
-
-function borderTop(w, title) {
-  const t = ` ${title} `;
-  return cyan('┌') + cyan('─'.repeat(Math.max(0, w - 2))).slice(0, Math.max(0, w - 2)) + cyan('┐');
-}
-function titleLine(w, title) {
-  return cyan('│') + padAnsi(bold(title), w - 2) + cyan('│');
-}
-function midLine(left, right) { return left + ' ' + right; }
-function framedContentLine(w, s) { return cyan('│') + padAnsi(s, w - 2) + cyan('│'); }
-function borderBottom(w) { return cyan('└') + cyan('─'.repeat(Math.max(0, w - 2))) + cyan('┘'); }
-
-function render(force = false) {
-  if (rendering) return;
-  rendering = true;
-  try {
-    const { cols, leftW, rightW, bodyH } = layout();
-    const devs = state.devices;
-    if (state.selectedIndex >= devs.length) state.selectedIndex = Math.max(0, devs.length - 1);
-    if (state.selectedIndex < 0) state.selectedIndex = 0;
-
-    const visibleDeviceRows = Math.max(1, Math.floor((bodyH - 2) / 2));
-    if (state.selectedIndex < state.leftScroll) state.leftScroll = state.selectedIndex;
-    if (state.selectedIndex >= state.leftScroll + visibleDeviceRows) state.leftScroll = state.selectedIndex - visibleDeviceRows + 1;
-
-    const leftLines = [];
-    for (let i = state.leftScroll; i < Math.min(devs.length, state.leftScroll + visibleDeviceRows); i++) {
-      leftLines.push(...listLine(devs[i], leftW - 2, i, state.selectedIndex));
-    }
-    while (leftLines.length < bodyH - 2) leftLines.push('');
-
-    const rightAll = detailLines(devs[state.selectedIndex], rightW - 2);
-    if (state.rightScroll > Math.max(0, rightAll.length - (bodyH - 2))) state.rightScroll = Math.max(0, rightAll.length - (bodyH - 2));
-    const rightLines = rightAll.slice(state.rightScroll, state.rightScroll + bodyH - 2);
-    while (rightLines.length < bodyH - 2) rightLines.push('');
-
-    const frame = [];
-    frame.push(midLine(borderTop(leftW, ''), borderTop(rightW, '')));
-    frame.push(midLine(titleLine(leftW, 'USB Devices'), titleLine(rightW, devs[state.selectedIndex]?.name || 'Details')));
-    for (let i = 0; i < bodyH - 2; i++) frame.push(midLine(framedContentLine(leftW, leftLines[i]), framedContentLine(rightW, rightLines[i])));
-    frame.push(midLine(borderBottom(leftW), borderBottom(rightW)));
-    const status = `Refreshed (${state.status}); last scan ${state.lastScan}; devices ${devs.length}; ↑/↓/j/k select, mouse click, r refresh, d raw, m kernel, q quit`;
-    frame.push(cyan('┌') + cyan('─'.repeat(cols - 2)) + cyan('┐'));
-    frame.push(cyan('│') + padAnsi(status, cols - 2) + cyan('│'));
-    frame.push(cyan('└') + cyan('─'.repeat(cols - 2)) + cyan('┘'));
-
-    const out = frame.join('\n');
-    if (force || out !== lastFrame) {
-      process.stdout.write('\x1b[?25l\x1b[H' + out + '\x1b[J');
-      lastFrame = out;
-    }
-  } finally {
-    rendering = false;
+function suggestions(d) {
+  const lines = [];
+  const nodes = d.devNodes || [];
+  if (nodes.some(n => /ttyUSB|ttyACM/.test(n.path))) {
+    lines.push('  Serial device: prefer /dev/serial/by-id when available.');
+    lines.push('  If permission denied, check groups: groups $USER; usually dialout/plugdev matters.');
+    const serials = nodes.filter(n => /ttyUSB|ttyACM/.test(n.path));
+    if (serials.length > 1) lines.push('  Multi-port serial: interface 00 usually Channel A, 01 usually Channel B.');
+  } else if (nodes.some(n => /video\d+$/.test(n.path))) {
+    lines.push('  Camera/capture device: install v4l-utils, then inspect formats with v4l2-ctl --list-formats-ext.');
+  } else if (nodes.some(n => /sd[a-z]|nvme/.test(n.path))) {
+    lines.push('  Storage device: inspect filesystem/mount with lsblk -f.');
+  } else if (/root hub/i.test(d.name)) {
+    lines.push('  Root hub: parent controller for devices on this USB bus. It normally has no useful /dev handle.');
+  } else {
+    lines.push('  Check Driver tab for udev details and Topology tab for hub/port placement.');
   }
+  return lines;
 }
-
-async function refresh(reason = 'poll') {
-  if (pollBusy) return;
-  pollBusy = true;
-  try {
-    const oldSelectedKey = state.devices[state.selectedIndex]?.key;
-    const oldKeys = new Set(state.devices.map(d => d.key));
-    const devices = await buildModel();
-    const now = Date.now();
-    for (const d of devices) {
-      if (state.previousKeys.size && !state.previousKeys.has(d.key)) state.newUntil.set(d.key, now + NEW_MS);
-    }
-    state.previousKeys = new Set(devices.map(d => d.key));
-    state.devices = devices;
-    const keepIdx = devices.findIndex(d => d.key === oldSelectedKey);
-    state.selectedIndex = keepIdx >= 0 ? keepIdx : Math.min(state.selectedIndex, Math.max(0, devices.length - 1));
-    state.lastScan = new Date().toLocaleTimeString();
-    state.status = reason;
-    render(true);
-  } catch (e) {
-    state.status = `error: ${e.message || e}`;
-    render(true);
-  } finally {
-    pollBusy = false;
+function render() {
+  const { cols, rows: termRows } = termSize();
+  const leftW = Math.max(42, Math.min(72, Math.floor(cols * 0.45)));
+  const rightW = Math.max(20, cols - leftW - 3);
+  const height = Math.max(10, termRows - 4);
+  const rows = buildRows();
+  state.rows = rows;
+  state.leftRowMap.clear();
+  let out = '\x1b[?25l\x1b[H';
+  out += pad(cyan('USB Detective'), cols) + '\n';
+  out += pad(`Tree: ↑/↓ select  [/] tabs  PgUp/PgDn scroll  r refresh  q quit`, cols) + '\n';
+  out += '─'.repeat(cols) + '\n';
+  const d = selectedDevice();
+  const details = detailLines(d);
+  const tabLine = tabs.map((t,i) => i === state.tab ? `[${t}]` : ` ${t} `).join('  ');
+  const detailHead = `${tabLine}`;
+  const detailBody = [detailHead, '─'.repeat(rightW), ...details].slice(state.detailScroll, state.detailScroll + height);
+  for (let i = 0; i < height; i++) {
+    const leftRaw = rows[i] ? rowText(rows[i], i) : '';
+    if (rows[i] && rows[i].selectable) state.leftRowMap.set(i + 4, rows[i].key);
+    const left = pad(leftRaw, leftW);
+    const sep = ' │ ';
+    const right = pad(detailBody[i] || '', rightW);
+    out += left + sep + right + '\n';
   }
+  out += '─'.repeat(cols) + '\n';
+  out += pad(state.status || '', cols) + '\x1b[J';
+  process.stdout.write(out);
 }
-
-function moveSelection(delta) {
-  state.selectedIndex = Math.max(0, Math.min(state.devices.length - 1, state.selectedIndex + delta));
-  state.rightScroll = 0;
-  render(true);
+function rowText(row) {
+  if (row.type === 'bus') return bold(row.text);
+  if (row.type === 'node') return row.text;
+  const isSel = row.key === state.selectedKey;
+  const isNew = state.addedUntil.has(row.key);
+  const isRemoved = row.device && row.device.removed;
+  let txt = row.text;
+  if (isRemoved) txt = red(txt);
+  else if (isNew) txt = green(txt);
+  if (isSel) txt = selected(txt);
+  return txt;
 }
+function termSize() { return { cols: process.stdout.columns || 120, rows: process.stdout.rows || 36 }; }
+function selectDelta(delta) {
+  const selectable = state.rows.filter(r => r.selectable);
+  if (!selectable.length) return;
+  let idx = selectable.findIndex(r => r.key === state.selectedKey);
+  if (idx < 0) idx = 0;
+  idx = Math.max(0, Math.min(selectable.length - 1, idx + delta));
+  state.selectedKey = selectable[idx].key;
+  state.selectedIndex = idx;
+  state.detailScroll = 0;
+  render();
+}
+function setTab(t) { state.tab = Math.max(0, Math.min(tabs.length - 1, t)); state.detailScroll = 0; render(); }
+function scrollDetail(delta) { state.detailScroll = Math.max(0, state.detailScroll + delta); render(); }
 function cleanup() {
-  if (pollTimer) clearInterval(pollTimer);
-  process.stdout.write('\x1b[?1000l\x1b[?25h\x1b[0m\n');
+  process.stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[0m\n');
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
-  process.exit(0);
 }
-
-function handleMouse(buf) {
-  // Basic X10 mouse: ESC [ M Cb Cx Cy
-  const s = buf.toString('binary');
-  const idx = s.indexOf('\x1b[M');
-  if (idx < 0 || s.length < idx + 6) return false;
-  const x = s.charCodeAt(idx + 4) - 32;
-  const y = s.charCodeAt(idx + 5) - 32;
-  const { leftW, bodyH } = layout();
-  if (x >= 1 && x <= leftW && y >= 3 && y < bodyH + 1) {
-    const row = y - 3;
-    const devRow = Math.floor(row / 2);
-    const newIdx = state.leftScroll + devRow;
-    if (newIdx >= 0 && newIdx < state.devices.length) {
-      state.selectedIndex = newIdx;
-      state.rightScroll = 0;
-      render(true);
+function handleInput(buf) {
+  const s = buf.toString('utf8');
+  if (s === '\u0003' || s === 'q') { cleanup(); process.exit(0); }
+  if (s === 'r') { poll(true); return; }
+  if (s === 'j' || s === '\x1b[B') { selectDelta(1); return; }
+  if (s === 'k' || s === '\x1b[A') { selectDelta(-1); return; }
+  if (s === '\x1b[6~') { scrollDetail(10); return; }
+  if (s === '\x1b[5~') { scrollDetail(-10); return; }
+  if (s === ']') { setTab(state.tab + 1); return; }
+  if (s === '[') { setTab(state.tab - 1); return; }
+  if (/^[1-6]$/.test(s)) { setTab(Number(s) - 1); return; }
+  const mouse = s.match(/\x1b\[<([0-9]+);([0-9]+);([0-9]+)([mM])/);
+  if (mouse) {
+    const code = Number(mouse[1]), x = Number(mouse[2]), y = Number(mouse[3]), up = mouse[4] === 'm';
+    if (!up && code === 64) return scrollDetail(-3);
+    if (!up && code === 65) return scrollDetail(3);
+    if (!up && x <= Math.max(42, Math.min(72, Math.floor((process.stdout.columns || 120) * 0.45)))) {
+      const key = state.leftRowMap.get(y);
+      if (key) { state.selectedKey = key; state.detailScroll = 0; render(); }
     }
-    return true;
   }
-  return false;
 }
-
 async function main() {
-  if (!process.stdout.isTTY || !process.stdin.isTTY) {
-    console.error('usbdetective TUI needs a real terminal.');
-    process.exit(1);
+  process.on('exit', cleanup);
+  process.on('SIGINT', () => { cleanup(); process.exit(0); });
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on('data', handleInput);
+    process.stdout.write('\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J');
   }
-  process.stdout.write('\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h');
-  readline.emitKeypressEvents(process.stdin);
-  process.stdin.setRawMode(true);
-
-  process.stdin.on('data', buf => { handleMouse(buf); });
-  process.stdin.on('keypress', (str, key) => {
-    if (key && key.ctrl && key.name === 'c') cleanup();
-    if (!key) return;
-    if (key.name === 'q') cleanup();
-    else if (key.name === 'up' || str === 'k') moveSelection(-1);
-    else if (key.name === 'down' || str === 'j') moveSelection(1);
-    else if (key.name === 'pageup') moveSelection(-10);
-    else if (key.name === 'pagedown') moveSelection(10);
-    else if (key.name === 'r') refresh('manual');
-    else if (key.name === 'd') { state.showRaw = !state.showRaw; state.rightScroll = 0; render(true); }
-    else if (key.name === 'm') { state.showKernel = !state.showKernel; state.rightScroll = 0; render(true); }
-  });
-
-  process.on('SIGINT', cleanup);
-  process.on('SIGTERM', cleanup);
-  process.stdout.on('resize', () => render(true));
-
-  await refresh('initial');
-  pollTimer = setInterval(() => refresh('poll'), POLL_MS);
+  await poll(true);
+  setInterval(() => poll(false), POLL_MS);
+  setInterval(() => {
+    const now = Date.now();
+    let changed = false;
+    for (const [k,t] of [...state.addedUntil]) if (t <= now) { state.addedUntil.delete(k); changed = true; }
+    for (const [k,t] of [...state.removedUntil]) if (t <= now) { state.removedUntil.delete(k); state.removedDevices.delete(k); changed = true; }
+    if (changed) render();
+  }, 500);
 }
-
-main().catch(err => {
-  process.stdout.write('\x1b[?1000l\x1b[?25h\x1b[0m\n');
-  console.error(err);
-  process.exit(1);
-});
+main().catch(e => { cleanup(); console.error(e); process.exit(1); });
