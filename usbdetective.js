@@ -72,6 +72,7 @@ function run(cmd, args = [], opts = {}) {
 async function sh(command, opts = {}) { return run('bash', ['-lc', command], opts); }
 
 let state = {
+  startupMessage: 'Scanning USB buses, hubs, drivers, handles and udev data... please wait',
   devices: [], rows: [], selectedKey: null, selectedRowKey: null, selectedIndex: 0, detailScroll: 0, leftScroll: 0, tab: 0,
   previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
@@ -1193,6 +1194,24 @@ function ensureSelectedVisualVisible(visualRows, height) {
 
 function render() {
   pruneHighlights();
+
+  if (!state.lastPollAt && !state.devices.length) {
+    const { cols, rows } = termSize();
+    let out = '\x1b[?25l\x1b[H';
+    out += pad(cyan('USB Detective'), cols) + '\n';
+    out += '─'.repeat(cols) + '\n';
+    out += '\n';
+    out += pad(state.startupMessage, cols) + '\n';
+    out += '\n';
+    out += pad('Gathering USB topology from lsusb -t...', cols) + '\n';
+    out += pad('Enumerating /dev handles...', cols) + '\n';
+    out += pad('Querying udev properties...', cols) + '\n';
+    out += pad('Scanning process handles...', cols) + '\n';
+    out += '\x1b[J';
+    process.stdout.write(out);
+    return;
+  }
+
   const { cols, rows: termRows } = termSize();
   const leftW = Math.max(48, Math.min(96, Math.floor(cols * 0.46)));
   const rightW = Math.max(20, cols - leftW - 3);
@@ -1304,6 +1323,8 @@ async function main() {
     process.stdin.on('data', handleInput);
     process.stdout.write('\x1b[2J');
   }
+
+  render();
   await poll(true);
   setInterval(() => poll(false), POLL_MS);
   setInterval(() => {
