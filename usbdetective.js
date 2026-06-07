@@ -5,15 +5,18 @@
   No npm dependencies. Uses lsusb, udevadm, lsblk, dmesg, and optional v4l2-ctl.
 
   Keys:
-    Up/Down or j/k     Select USB device rows only
+    Up/Down or j/k     Select USB devices/hubs in the topology tree
     PgUp/PgDn          Scroll details
     Left/Right         Previous/next detail tab
-    1..6               Select detail tab
+    1..5               Select detail tab
     r                  Refresh now
     q or Ctrl-C        Quit
 
   Mouse:
     Disabled intentionally. Keyboard navigation is reliable and predictable.
+
+  Left pane:
+    Real USB topology from lsusb -t, enriched with lsusb names and /dev handles.
 
   Env:
     USB_DETECTIVE_POLL_MS=1000
@@ -74,7 +77,7 @@ let state = {
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
   leftRowMap: new Map(), lastPollAt: null
 };
-const tabs = ['Summary', '/dev', 'Topology', 'Driver', 'Kernel', 'Raw USB'];
+const tabs = ['Summary', '/dev', 'Driver', 'Kernel', 'Raw USB'];
 
 function parseLsusbLine(line) {
   const m = line.match(/^Bus\s+(\d+)\s+Device\s+(\d+):\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\s*(.*)$/);
@@ -203,11 +206,51 @@ async function collectSnapshot() {
   for (const d of devices) await enrichDevice(d, devNodes, blockMap);
   return { devices, tree, kernel, when: new Date() };
 }
+function pruneHighlights(now = Date.now()) {
+  let changed = false;
+  for (const [k, t] of [...state.addedUntil]) {
+    if (t <= now) { state.addedUntil.delete(k); changed = true; }
+  }
+  for (const [k, t] of [...state.removedUntil]) {
+    if (t <= now) {
+      state.removedUntil.delete(k);
+      state.removedDevices.delete(k);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function isAddedKey(key) {
+  const until = state.addedUntil.get(key);
+  if (!until) return false;
+  if (until <= Date.now()) {
+    state.addedUntil.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function isRemovedDevice(d) {
+  if (!d || !d.removed) return false;
+  const until = state.removedUntil.get(d.key);
+  if (!until) return false;
+  if (until <= Date.now()) {
+    state.removedUntil.delete(d.key);
+    state.removedDevices.delete(d.key);
+    return false;
+  }
+  return true;
+}
+
 function updateHighlights(newDevices) {
   const now = Date.now();
+  pruneHighlights(now);
   const newKeys = new Set(newDevices.map(d => d.key));
   for (const d of newDevices) {
-    if (!state.previousKeys.has(d.key) && state.previousKeys.size) state.addedUntil.set(d.key, now + HIGHLIGHT_MS);
+    if (!state.previousKeys.has(d.key) && state.previousKeys.size) {
+      state.addedUntil.set(d.key, now + HIGHLIGHT_MS);
+    }
   }
   for (const oldKey of state.previousKeys) {
     if (!newKeys.has(oldKey)) {
@@ -219,8 +262,6 @@ function updateHighlights(newDevices) {
       }
     }
   }
-  for (const [k, t] of [...state.addedUntil]) if (t <= now) state.addedUntil.delete(k);
-  for (const [k, t] of [...state.removedUntil]) if (t <= now) { state.removedUntil.delete(k); state.removedDevices.delete(k); }
   state.previousKeys = newKeys;
 }
 function mergedDevices(devices) {
@@ -229,7 +270,18 @@ function mergedDevices(devices) {
   return out.sort((a,b) => a.bus.localeCompare(b.bus) || Number(a.dev) - Number(b.dev));
 }
 function signature(snap) {
-  return JSON.stringify({ d: snap.devices.map(d => [d.key, d.vid, d.pid, d.name, d.devNodes.map(n => n.path).sort()]), r: [...state.removedDevices.keys()].sort(), tab: state.tab, sel: state.selectedKey, row: state.selectedRowKey, scroll: state.detailScroll, leftScroll: state.leftScroll, size: termSize() });
+  pruneHighlights();
+  return JSON.stringify({
+    d: snap.devices.map(d => [d.key, d.vid, d.pid, d.name, d.devNodes.map(n => n.path).sort()]),
+    r: [...state.removedDevices.keys()].sort(),
+    a: [...state.addedUntil.keys()].sort(),
+    tab: state.tab,
+    sel: state.selectedKey,
+    row: state.selectedRowKey,
+    scroll: state.detailScroll,
+    leftScroll: state.leftScroll,
+    size: termSize()
+  });
 }
 async function poll(force = false) {
   if (state.polling) return;
@@ -263,12 +315,26 @@ async function poll(force = false) {
 }
 function selectedDevice() { return state.devices.find(d => d.key === state.selectedKey) || state.devices[0] || null; }
 function deviceLabel(d) {
-  const devs = (d.devNodes || []).map(n => n.path).sort();
   const name = d.name || '(unnamed USB device)';
-  const devText = devs.length ? `  handles: ${devs.length}` : '';
-  return `${d.key} ${d.vid}:${d.pid} ${name}${devText}`;
+  return `${d.key} ${d.vid}:${d.pid} ${name}`;
 }
-function buildRows() {
+
+function topoSummaryForNode(t) {
+  const bits = [];
+  if (t.port) bits.push(`P${String(t.port).padStart(3, '0')}`);
+  if (t.speed) bits.push(t.speed);
+  const drivers = [...new Set((t.interfaces || []).map(i => i.driver).filter(Boolean))];
+  if (drivers.length) bits.push(drivers.join('/'));
+  return bits.length ? `  ${bits.join(' ')}` : '';
+}
+
+function devHandleSummary(d) {
+  const count = (d.devNodes || []).length;
+  if (!count) return '';
+  return `  handles:${count}`;
+}
+
+function buildFallbackRows() {
   const rows = [];
   const buses = [...new Set(state.devices.map(d => d.bus))].sort();
   for (const bus of buses) {
@@ -282,7 +348,7 @@ function buildRows() {
         key:d.key,
         selectKey:d.key,
         device:d,
-        text:`${branch} ${deviceLabel(d)}`,
+        text:`${branch} ${deviceLabel(d)}${devHandleSummary(d)}`,
         selectable:true
       });
       const nodes = (d.devNodes || []).map(n => n.path).sort();
@@ -297,6 +363,210 @@ function buildRows() {
       }));
     });
   }
+  return rows;
+}
+
+function parseTopologyLine(line, currentBus) {
+  const root = line.match(/^\/:\s+Bus\s+(\d+)\.Port\s+(\d+):\s+Dev\s+(\d+),\s*(.*)$/);
+  if (root) {
+    const [, bus, port, dev, rest] = root;
+    return {
+      indent: -1,
+      bus,
+      dev: String(dev).padStart(3, '0'),
+      key: `${bus}:${String(dev).padStart(3, '0')}`,
+      port,
+      rest,
+      isRoot: true
+    };
+  }
+
+  const child = line.match(/^(\s*)\|__\s+Port\s+(\d+):\s+Dev\s+(\d+),\s*(.*)$/);
+  if (!child || !currentBus) return null;
+  const [, spaces, port, dev, rest] = child;
+  return {
+    indent: spaces.length,
+    bus: currentBus,
+    dev: String(dev).padStart(3, '0'),
+    key: `${currentBus}:${String(dev).padStart(3, '0')}`,
+    port,
+    rest,
+    isRoot: false
+  };
+}
+
+function parseTopoRest(rest) {
+  const info = {};
+  const ifMatch = String(rest || '').match(/\bIf\s+(\d+)/);
+  if (ifMatch) info.iface = ifMatch[1];
+  const classMatch = String(rest || '').match(/\bClass=([^,]+)/);
+  if (classMatch) info.className = classMatch[1].trim();
+  const driverMatch = String(rest || '').match(/\bDriver=([^,]+)/);
+  if (driverMatch) info.driver = driverMatch[1].trim();
+  const speedMatch = String(rest || '').match(/,\s*([^,\s]+)\s*$/);
+  if (speedMatch) info.speed = speedMatch[1].trim();
+  return info;
+}
+
+function mergeTopoInterface(node, parsed) {
+  const info = parseTopoRest(parsed.rest);
+  if (info.speed && !node.speed) node.speed = info.speed;
+  if (info.className && !node.className) node.className = info.className;
+  if (info.driver && !node.driver) node.driver = info.driver;
+  const ifaceKey = `${info.iface ?? ''}|${info.className ?? ''}|${info.driver ?? ''}|${info.speed ?? ''}`;
+  if (!node._ifaceKeys.has(ifaceKey)) {
+    node._ifaceKeys.add(ifaceKey);
+    node.interfaces.push(info);
+  }
+}
+
+function parseLsusbTopology(treeText) {
+  const roots = [];
+  const stack = [];
+  let currentBus = '';
+
+  for (const line of String(treeText || '').split('\n')) {
+    if (!line.trim()) continue;
+    const parsed = parseTopologyLine(line, currentBus);
+    if (!parsed) continue;
+    currentBus = parsed.bus;
+
+    const node = {
+      type: 'topo',
+      bus: parsed.bus,
+      dev: parsed.dev,
+      key: parsed.key,
+      port: parsed.port,
+      isRoot: parsed.isRoot,
+      interfaces: [],
+      children: [],
+      _ifaceKeys: new Set()
+    };
+    mergeTopoInterface(node, parsed);
+
+    if (parsed.isRoot) {
+      roots.push(node);
+      stack.length = 0;
+      stack.push({ indent: parsed.indent, node });
+      continue;
+    }
+
+    while (stack.length && stack[stack.length - 1].indent >= parsed.indent) stack.pop();
+    const parent = stack.length ? stack[stack.length - 1].node : roots[roots.length - 1];
+    if (!parent) continue;
+
+    let existing = parent.children.find(c => c.key === node.key && c.port === node.port);
+    if (existing) {
+      mergeTopoInterface(existing, parsed);
+      stack.push({ indent: parsed.indent, node: existing });
+    } else {
+      parent.children.push(node);
+      stack.push({ indent: parsed.indent, node });
+    }
+  }
+
+  function cleanup(n) {
+    delete n._ifaceKeys;
+    for (const c of n.children) cleanup(c);
+  }
+  for (const r of roots) cleanup(r);
+  return roots;
+}
+
+function enrichTopoNode(t, deviceMap) {
+  const d = deviceMap.get(t.key);
+  t.device = d || {
+    bus: t.bus,
+    dev: t.dev,
+    key: t.key,
+    vid: '????',
+    pid: '????',
+    name: t.className || '(USB device)',
+    devNodes: []
+  };
+  for (const c of t.children || []) enrichTopoNode(c, deviceMap);
+}
+
+function addTopoNodeRows(rows, t, prefix, isLast) {
+  const d = t.device;
+  const branch = isLast ? '└─' : '├─';
+  const name = d.name || t.className || '(unnamed USB device)';
+  const id = d.vid && d.pid ? `${d.vid}:${d.pid}` : '????:????';
+  const rootTag = t.isRoot ? 'root' : topoSummaryForNode(t);
+  const topoBits = rootTag ? `  ${rootTag}` : '';
+  const text = `${prefix}${branch} ${t.key} ${id} ${name}${topoBits}${devHandleSummary(d)}`;
+  rows.push({
+    type:'dev',
+    key:t.key,
+    selectKey:t.key,
+    device:d,
+    topo:t,
+    text,
+    selectable:true
+  });
+
+  const childPrefix = prefix + (isLast ? '   ' : '│  ');
+  const children = t.children || [];
+  const nodes = (d.devNodes || []).map(n => n.path).sort();
+
+  children.forEach((c, i) => {
+    const childIsLast = i === children.length - 1 && nodes.length === 0;
+    addTopoNodeRows(rows, c, childPrefix, childIsLast);
+  });
+
+  nodes.forEach((n, j) => {
+    const nodeIsLast = j === nodes.length - 1;
+    rows.push({
+      type:'node',
+      key:`${t.key}:${n}`,
+      selectKey:t.key,
+      parentKey:t.key,
+      device:d,
+      text:`${childPrefix}${nodeIsLast ? '└─' : '├─'} ${n}`,
+      selectable:false
+    });
+  });
+}
+
+function buildRows() {
+  const roots = parseLsusbTopology(state.tree);
+  if (!roots.length) return buildFallbackRows();
+
+  const deviceMap = new Map(state.devices.map(d => [d.key, d]));
+  for (const r of roots) enrichTopoNode(r, deviceMap);
+
+  const rows = [];
+  const byBus = new Map();
+  for (const r of roots) {
+    if (!byBus.has(r.bus)) byBus.set(r.bus, []);
+    byBus.get(r.bus).push(r);
+  }
+
+  for (const bus of [...byBus.keys()].sort()) {
+    rows.push({ type:'bus', key:`bus:${bus}`, text:`USB Bus ${bus}`, selectable:false });
+    const busRoots = byBus.get(bus).sort((a,b) => Number(a.dev) - Number(b.dev));
+    busRoots.forEach((r, i) => addTopoNodeRows(rows, r, '', i === busRoots.length - 1));
+  }
+
+  // Some devices can appear in lsusb but not in lsusb -t during hotplug churn.
+  // Keep them visible instead of silently losing them.
+  const seen = new Set(rows.filter(r => r.type === 'dev').map(r => r.key));
+  const missing = state.devices.filter(d => !seen.has(d.key));
+  if (missing.length) {
+    rows.push({ type:'bus', key:'bus:unmapped', text:'USB devices not placed in topology yet', selectable:false });
+    missing.forEach((d, i) => {
+      const isLast = i === missing.length - 1;
+      rows.push({
+        type:'dev',
+        key:d.key,
+        selectKey:d.key,
+        device:d,
+        text:`${isLast ? '└─' : '├─'} ${deviceLabel(d)}${devHandleSummary(d)}`,
+        selectable:true
+      });
+    });
+  }
+
   return rows;
 }
 
@@ -372,9 +642,6 @@ function detailLines(d) {
       lines.push('');
     }
   } else if (state.tab === 2) {
-    lines.push(bold('USB topology from lsusb -t'), '');
-    lines.push(...(state.tree || '').split('\n'));
-  } else if (state.tab === 3) {
     lines.push(bold('Driver / udev properties'), '');
     if (!activeNodes.length) lines.push('No /dev-backed udev properties found for this device.');
     for (const n of activeNodes) {
@@ -383,12 +650,12 @@ function detailLines(d) {
       for (const k of keys) if (n.props[k]) lines.push(`  ${rightPadRaw(k, 24)} ${n.props[k]}`);
       lines.push('');
     }
-  } else if (state.tab === 4) {
+  } else if (state.tab === 3) {
     lines.push(bold('Recent relevant kernel clues'), '');
     const relevant = state.lastKernel.filter(l => l.includes(`${Number(d.bus)}-`) || l.toLowerCase().includes((d.name || '').split(' ')[0]?.toLowerCase() || '___') || /usb|ttyUSB|ttyACM|disconnect|attached/i.test(l)).slice(-50);
     if (!relevant.length) lines.push('No recent matching kernel lines in dmesg tail.');
     else lines.push(...relevant);
-  } else if (state.tab === 5) {
+  } else if (state.tab === 4) {
     lines.push(bold(`Raw USB descriptor excerpt: lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`), '');
     lines.push('Press r to refresh. This tab loads on demand in the next version; current useful raw command:');
     lines.push(`  lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`);
@@ -411,9 +678,9 @@ function suggestions(d) {
   } else if (nodes.some(n => /sd[a-z]|nvme/.test(n.path))) {
     lines.push('  Storage device: inspect filesystem/mount with lsblk -f.');
   } else if (/root hub/i.test(d.name)) {
-    lines.push(`  Root hub: logical top of USB Bus ${d.bus}. Devices on this bus are downstream from it, but the left tree is grouped by bus/device number, not true port nesting. Use the Topology tab for actual hub/port parent-child layout.`);
+    lines.push(`  Root hub: logical top of USB Bus ${d.bus}. Downstream hubs/devices are shown under it in the left topology tree.`);
   } else {
-    lines.push('  Check Driver tab for udev details and Topology tab for hub/port placement.');
+    lines.push('  Check Driver tab for udev details. The left pane shows hub/port placement.');
   }
   return lines;
 }
@@ -471,19 +738,78 @@ function wrapDetailLines(lines, width) {
   return out;
 }
 
+function leftRowWrapIndent(text) {
+  const m = String(text || '').match(/^(.*?(?:├─|└─)\s*)/);
+  if (m) return ' '.repeat(stripAnsi(m[1]).length);
+  const plain = stripAnsi(text || '');
+  const m2 = plain.match(/^\s*/);
+  return (m2 ? m2[0] : '') + '  ';
+}
+
+function wrapLeftText(raw, width) {
+  raw = stripAnsi(String(raw || ''));
+  if (width <= 8 || raw.length <= width) return [raw];
+
+  const contIndent = leftRowWrapIndent(raw);
+  const out = [];
+  let line = raw;
+  let first = true;
+
+  while (line.length > width) {
+    const indent = first ? '' : contIndent;
+    const available = Math.max(8, width - indent.length);
+    const src = first ? line : line.slice(indent.length);
+    let cut = src.lastIndexOf(' ', available);
+    if (cut < Math.floor(available * 0.55)) cut = available;
+    out.push(indent + src.slice(0, cut).trimEnd());
+    const rest = src.slice(cut).trimStart();
+    line = contIndent + rest;
+    first = false;
+  }
+
+  out.push(line);
+  return out;
+}
+
+function buildLeftVisualRows(rows, width) {
+  const out = [];
+  for (const row of rows) {
+    const parts = wrapLeftText(row.text, width);
+    parts.forEach((text, partIndex) => out.push({ row, text, partIndex }));
+  }
+  return out;
+}
+
+function selectedVisualIndex(visualRows) {
+  let idx = visualRows.findIndex(v => v.row.type === 'dev' && v.row.key === state.selectedRowKey);
+  if (idx < 0) idx = visualRows.findIndex(v => v.row.type === 'dev' && v.row.selectKey === state.selectedKey);
+  return idx < 0 ? 0 : idx;
+}
+
+function ensureSelectedVisualVisible(visualRows, height) {
+  const idx = selectedVisualIndex(visualRows);
+  if (idx < state.leftScroll) state.leftScroll = idx;
+  if (idx >= state.leftScroll + height) state.leftScroll = Math.max(0, idx - height + 1);
+  const maxScroll = Math.max(0, visualRows.length - height);
+  if (state.leftScroll > maxScroll) state.leftScroll = maxScroll;
+  if (state.leftScroll < 0) state.leftScroll = 0;
+}
+
 function render() {
+  pruneHighlights();
   const { cols, rows: termRows } = termSize();
-  const leftW = Math.max(42, Math.min(72, Math.floor(cols * 0.45)));
+  const leftW = Math.max(48, Math.min(96, Math.floor(cols * 0.46)));
   const rightW = Math.max(20, cols - leftW - 3);
   const height = Math.max(10, termRows - 4);
   const rows = buildRows();
-  ensureSelectedVisible(rows, height);
+  const leftVisualRows = buildLeftVisualRows(rows, leftW);
+  ensureSelectedVisualVisible(leftVisualRows, height);
   state.rows = rows;
   state.leftRowMap.clear();
 
   let out = '\x1b[?25l\x1b[H';
   out += pad(cyan('USB Detective'), cols) + '\n';
-  out += pad(`Tree: ↑/↓ select USB device  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  r refresh  q quit`, cols) + '\n';
+  out += pad(`Tree: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  r refresh  q quit`, cols) + '\n';
   out += '─'.repeat(cols) + '\n';
 
   const d = selectedDevice();
@@ -492,39 +818,31 @@ function render() {
   const detailHead = `${tabLine}`;
   const detailBody = wrapDetailLines([detailHead, '─'.repeat(rightW), ...details], rightW).slice(state.detailScroll, state.detailScroll + height);
 
-  const visibleLeft = rows.slice(state.leftScroll, state.leftScroll + height);
+  const visibleLeft = leftVisualRows.slice(state.leftScroll, state.leftScroll + height);
   for (let i = 0; i < height; i++) {
-    const row = visibleLeft[i];
-    const screenY = i + 4; // terminal rows are 1-based; content begins after 3 header rows
-    if (row && (row.type === 'dev' || row.type === 'node')) state.leftRowMap.set(screenY, row.key);
-
-    // Build the visible left cell in two phases:
-    //   1) truncate/pad plain text to the pane width
-    //   2) apply color/highlight to the already-sized cell
-    // This matters because truncating an ANSI-colored selected row strips the
-    // highlight. Long rows like cameras/controllers were selected internally,
-    // but the blue selection vanished because pad() called trunc().
-    const left = row ? formatLeftCell(row, leftW) : ' '.repeat(leftW);
+    const vrow = visibleLeft[i];
+    const row = vrow ? vrow.row : null;
+    const left = vrow ? formatLeftVisualCell(vrow, leftW) : ' '.repeat(leftW);
     const sep = ' │ ';
     const right = pad(detailBody[i] || '', rightW);
     out += left + sep + right + '\n';
   }
   out += '─'.repeat(cols) + '\n';
-  const scrollInfo = rows.length > height ? `  |  left ${state.leftScroll + 1}-${Math.min(rows.length, state.leftScroll + height)}/${rows.length}` : '';
+  const scrollInfo = leftVisualRows.length > height ? `  |  tree ${state.leftScroll + 1}-${Math.min(leftVisualRows.length, state.leftScroll + height)}/${leftVisualRows.length}` : '';
   out += pad((state.status || '') + scrollInfo, cols) + '\x1b[J';
   process.stdout.write(out);
 }
 function fitPlainCell(s, width) {
   s = String(s || '');
-  if (s.length > width) return s.slice(0, Math.max(0, width - 1)) + '…';
-  return s + ' '.repeat(width - s.length);
+  return s.length >= width ? s.slice(0, width) : s + ' '.repeat(width - s.length);
 }
 
-function formatLeftCell(row, width) {
+function formatLeftVisualCell(vrow, width) {
+  const row = vrow.row;
   const isSel = row.type === 'dev' && row.key === state.selectedRowKey;
-  const isNew = row.device && state.addedUntil.has(row.device.key);
-  const isRemoved = row.device && row.device.removed;
-  const cell = fitPlainCell(row.text, width);
+  const isNew = row.device && isAddedKey(row.device.key);
+  const isRemoved = row.device && isRemovedDevice(row.device);
+  const cell = fitPlainCell(vrow.text, width);
 
   if (isSel) return selected(cell);
   if (row.type === 'bus') return bold(cell);
@@ -544,15 +862,16 @@ function selectDelta(delta) {
   idx = Math.max(0, Math.min(selectable.length - 1, idx + delta));
   selectRow(selectable[idx]);
   state.selectedIndex = idx;
-  ensureSelectedVisible(rows, Math.max(10, (process.stdout.rows || 36) - 4));
   render();
 }
 function setTab(t) { state.tab = Math.max(0, Math.min(tabs.length - 1, t)); state.detailScroll = 0; render(); }
 function scrollDetail(delta) { state.detailScroll = Math.max(0, state.detailScroll + delta); render(); }
 function scrollLeft(delta) {
-  const rows = buildRows();
-  const height = Math.max(10, (process.stdout.rows || 36) - 4);
-  const maxScroll = Math.max(0, rows.length - height);
+  const { cols, rows: termRows } = termSize();
+  const leftW = Math.max(48, Math.min(96, Math.floor(cols * 0.46)));
+  const visualRows = buildLeftVisualRows(buildRows(), leftW);
+  const height = Math.max(10, termRows - 4);
+  const maxScroll = Math.max(0, visualRows.length - height);
   state.leftScroll = Math.max(0, Math.min(maxScroll, state.leftScroll + delta));
   render();
 }
@@ -572,7 +891,7 @@ function handleInput(buf) {
   if (s === '\x1b[5~') { scrollDetail(-10); return; }
   if (s === '\x1b[1;5B') { scrollLeft(5); return; }
   if (s === '\x1b[1;5A') { scrollLeft(-5); return; }
-  if (/^[1-6]$/.test(s)) { setTab(Number(s) - 1); return; }
+  if (/^[1-5]$/.test(s)) { setTab(Number(s) - 1); return; }
 
   // Mouse support is intentionally disabled. Terminal mouse coordinate reporting
   // varies enough between terminal emulators, font scaling, title bars, and pane
@@ -593,11 +912,7 @@ async function main() {
   await poll(true);
   setInterval(() => poll(false), POLL_MS);
   setInterval(() => {
-    const now = Date.now();
-    let changed = false;
-    for (const [k,t] of [...state.addedUntil]) if (t <= now) { state.addedUntil.delete(k); changed = true; }
-    for (const [k,t] of [...state.removedUntil]) if (t <= now) { state.removedUntil.delete(k); state.removedDevices.delete(k); changed = true; }
-    if (changed) render();
-  }, 500);
+    if (pruneHighlights()) render();
+  }, 250);
 }
 main().catch(e => { cleanup(); console.error(e); process.exit(1); });
