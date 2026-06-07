@@ -5,10 +5,11 @@
   No npm dependencies. Uses lsusb, udevadm, lsblk, dmesg, and optional v4l2-ctl.
 
   Keys:
-    Up/Down or j/k     Select USB devices/hubs in the topology tree
+    Up/Down            Select USB devices/hubs in the topology tree
     PgUp/PgDn          Scroll details
     Left/Right         Previous/next detail tab
     1..6               Select detail tab
+    k or K             Toggle keyboard mapping help
     r                  Refresh now
     q or Ctrl-C        Quit
 
@@ -58,6 +59,33 @@ function trunc(s, width) {
 function rightPadRaw(s, width) { s = String(s || ''); return s.length >= width ? s.slice(0, width) : s + ' '.repeat(width - s.length); }
 function shellQuote(s) { return `'${String(s).replace(/'/g, `'"'"'`)}'`; }
 
+const ALT_SCREEN_ON = '\x1b[?1049h';
+const ALT_SCREEN_OFF = '\x1b[?1049l';
+const CLEAR_SCREEN = '\x1b[2J\x1b[H';
+
+function enterTuiScreen() {
+  if (!process.stdout.isTTY) return;
+  process.stdout.write(ALT_SCREEN_ON + CLEAR_SCREEN + '\x1b[?25l');
+}
+
+function leaveTuiScreen() {
+  if (!process.stdout.isTTY) return;
+  process.stdout.write('\x1b[?25h\x1b[0m' + ALT_SCREEN_OFF);
+}
+
+function mouseWheelDelta(s) {
+  // SGR mouse wheel from many terminals:
+  //   ESC [ < 64 ; x ; y M  wheel up
+  //   ESC [ < 65 ; x ; y M  wheel down
+  const m = String(s || '').match(/\x1b\[<(\d+);(\d+);(\d+)[mM]/);
+  if (!m) return 0;
+  const code = Number(m[1]);
+  if (code === 64) return -3;
+  if (code === 65) return 3;
+  return 0;
+}
+
+
 function run(cmd, args = [], opts = {}) {
   return new Promise(resolve => {
     execFile(cmd, args, {
@@ -73,6 +101,7 @@ async function sh(command, opts = {}) { return run('bash', ['-lc', command], opt
 
 let state = {
   startupMessage: 'Scanning USB buses, hubs, drivers, handles and udev data... please wait',
+  showKeys: false,
   devices: [], rows: [], selectedKey: null, selectedRowKey: null, selectedIndex: 0, detailScroll: 0, leftScroll: 0, tab: 0,
   previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
@@ -1016,7 +1045,6 @@ function detailLines(d) {
     if (activeNodes.length) for (const n of activeNodes) lines.push(`  ${n.path}  ${n.iface ? '(' + n.iface + ')' : ''}  ${n.type}`);
     else lines.push('  None found. Root hubs and some internal devices may not create user-facing /dev nodes.');
     lines.push('');
-    lines.push(bold('Likely next step'));
     lines.push(...suggestions(d));
 
   } else if (state.tab === 1) {
@@ -1192,13 +1220,20 @@ function ensureSelectedVisualVisible(visualRows, height) {
   if (state.leftScroll < 0) state.leftScroll = 0;
 }
 
+
+function topHelpLine() {
+  if (!state.showKeys) return 'USB Detective v20260607 —  press k for keyboard mappings';
+
+  return 'Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit';
+}
+
 function render() {
   pruneHighlights();
 
   if (!state.lastPollAt && !state.devices.length) {
     const { cols, rows } = termSize();
     let out = '\x1b[?25l\x1b[H';
-    out += pad(cyan('USB Detective'), cols) + '\n';
+    out += pad(cyan('USB Detective v20260607'), cols) + '\n';
     out += '─'.repeat(cols) + '\n';
     out += '\n';
     out += pad(state.startupMessage, cols) + '\n';
@@ -1223,8 +1258,8 @@ function render() {
   state.leftRowMap.clear();
 
   let out = '\x1b[?25l\x1b[H';
-  out += pad(cyan('USB Detective'), cols) + '\n';
-  out += pad(`Tree: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  r refresh  q quit`, cols) + '\n';
+  out += pad(cyan('USB Detective v20260607'), cols) + '\n';
+  out += pad(topHelpLine(), cols) + '\n';
   out += '─'.repeat(cols) + '\n';
 
   const d = selectedDevice();
@@ -1289,16 +1324,28 @@ function scrollLeft(delta) {
   state.leftScroll = Math.max(0, Math.min(maxScroll, state.leftScroll + delta));
   render();
 }
+let didCleanup = false;
 function cleanup() {
-  process.stdout.write('\x1b[?25h\x1b[0m\n');
+  if (didCleanup) return;
+  didCleanup = true;
+  leaveTuiScreen();
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
 }
 function handleInput(buf) {
   const s = buf.toString('utf8');
+
+  // Mouse selection remains disabled, but terminals may still send wheel packets.
+  // Consume them so the terminal does not scroll the normal scrollback and smear
+  // old frames above the TUI.
+  const wheel = mouseWheelDelta(s);
+  if (wheel) { scrollDetail(wheel); return; }
+  if (/\x1b\[<\d+;\d+;\d+[mM]/.test(s)) return;
+
   if (s === '\u0003' || s === 'q') { cleanup(); process.exit(0); }
   if (s === 'r') { poll(true); return; }
+  if (s === 'k' || s === 'K') { state.showKeys = !state.showKeys; render(); return; }
   if (s === 'j' || s === '\x1b[B') { selectDelta(1); return; }
-  if (s === 'k' || s === '\x1b[A') { selectDelta(-1); return; }
+  if (s === '\x1b[A') { selectDelta(-1); return; }
   if (s === '\x1b[C') { setTab(state.tab + 1); return; }
   if (s === '\x1b[D') { setTab(state.tab - 1); return; }
   if (s === '\x1b[6~') { scrollDetail(10); return; }
@@ -1321,9 +1368,9 @@ async function main() {
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.on('data', handleInput);
-    process.stdout.write('\x1b[2J');
   }
 
+  enterTuiScreen();
   render();
   await poll(true);
   setInterval(() => poll(false), POLL_MS);
