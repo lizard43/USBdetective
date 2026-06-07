@@ -861,9 +861,10 @@ function shortCmd(p) {
 function handleDetailLines(d) {
   const lines = [];
   const activeNodes = d.devNodes || [];
+
   lines.push(bold('Handles / open processes'), '');
-  lines.push('This shows the /dev nodes created for the selected USB device and any processes currently holding those nodes open.');
-  lines.push('Process detection uses lsof when available plus a /proc/*/fd scan fallback.');
+  lines.push('For each /dev node created by the selected USB device, this tab shows node metadata and any user-space processes that currently have that node open.');
+  lines.push('Use PgUp/PgDn to scroll this pane when a device has many handles.');
   lines.push('');
 
   if (!activeNodes.length) {
@@ -874,8 +875,8 @@ function handleDetailLines(d) {
 
   let anyProcess = false;
 
-  for (const n of activeNodes) {
-    lines.push(bold(n.path));
+  activeNodes.forEach((n, idx) => {
+    lines.push(bold(`${idx + 1}/${activeNodes.length}  ${n.path}`));
     lines.push(`  Type: ${n.type}`);
     if (n.iface) lines.push(`  Interface: ${n.iface}`);
     if (n.stat) lines.push(`  Node: ${n.stat}`);
@@ -890,37 +891,39 @@ function handleDetailLines(d) {
     const users = n.users || {};
     const procs = users.processes || [];
     if (!procs.length) {
-      lines.push('  Open by: none detected');
+      lines.push('  Process holders: none detected');
       if (users.fuser && users.fuser.stderr && /Permission denied/i.test(users.fuser.stderr)) {
         lines.push('  Note: process detection may need sudo for full visibility.');
       }
+      if (users.fuser && users.fuser.stderr && /Cannot stat/i.test(users.fuser.stderr)) {
+        lines.push(`  fuser: ${users.fuser.stderr.trim()}`);
+      }
       lines.push('');
-      continue;
+      return;
     }
 
     anyProcess = true;
-    lines.push('  Open by:');
-    lines.push('    PID       USER        COMMAND / FD');
+    lines.push('  Process holders:');
+    lines.push('    PID       USER        FD(s)                 COMMAND');
     for (const p of procs) {
       const user = p.user || '?';
       const cmd = shortCmd(p) || '?';
       const fds = (p.fds || []).map(fd => `${fd.fd}${fd.type ? '/' + fd.type : ''}`).join(', ') || '?';
-      lines.push(`    ${rightPadRaw(p.pid, 9)} ${rightPadRaw(user, 11)} ${cmd}`);
-      lines.push(`              FD: ${fds}`);
+      lines.push(`    ${rightPadRaw(p.pid, 9)} ${rightPadRaw(user, 11)} ${rightPadRaw(fds, 21)} ${cmd}`);
       if (p.source) lines.push(`              Found by: ${p.source}`);
     }
     lines.push('');
-  }
+  });
 
   lines.push(bold('Notes'));
   if (anyProcess) {
     lines.push('  A listed process has the device node open right now. That can block serial ports, cameras, HID devices, or storage operations.');
-    lines.push('  Killing a process is intentionally not wired to a hotkey yet. Use the PID shown here with kill/killall after verifying it is safe.');
+    lines.push('  Kill is intentionally manual for now. Verify the PID, then use kill PID or kill -TERM PID.');
   } else {
     lines.push('  No process currently appears to hold these /dev handles open.');
-    lines.push('  Some kernel drivers claim USB interfaces without a user process keeping the /dev node open.');
+    lines.push('  That is normal for many input devices. The kernel driver can own the USB interface even when no user process has the /dev node open.');
   }
-  lines.push('  Useful manual checks:');
+  lines.push('  Manual checks:');
   for (const n of activeNodes) {
     lines.push(`    lsof ${n.path}`);
     lines.push(`    fuser -v ${n.path}`);
@@ -934,6 +937,7 @@ function detailLines(d) {
   const lines = [];
   const activeNodes = d.devNodes || [];
   const header = `${d.key}  ${d.vid}:${d.pid}  ${d.name || '(unnamed)'}`;
+
   if (state.tab === 0) {
     lines.push(bold(header), '');
     lines.push(`Status: ${d.removed ? red('recently unplugged') : 'active'}`);
@@ -948,6 +952,7 @@ function detailLines(d) {
     lines.push('');
     lines.push(bold('Likely next step'));
     lines.push(...suggestions(d));
+
   } else if (state.tab === 1) {
     lines.push(bold('/dev nodes and stable names'), '');
     if (!activeNodes.length) lines.push('No matching /dev nodes discovered for this USB device.');
@@ -956,13 +961,23 @@ function detailLines(d) {
       lines.push(`  Type: ${n.type}`);
       if (n.iface) lines.push(`  Interface: ${n.iface}`);
       if (n.stat) lines.push(`  Node: ${n.stat}`);
-      const best = n.links.find(l => l.startsWith('/dev/serial/by-id/')) || n.links.find(l => l.startsWith('/dev/v4l/by-id/')) || n.links.find(l => l.startsWith('/dev/disk/by-id/')) || n.links[0];
+      const best = n.links.find(l => l.startsWith('/dev/serial/by-id/')) ||
+        n.links.find(l => l.startsWith('/dev/v4l/by-id/')) ||
+        n.links.find(l => l.startsWith('/dev/disk/by-id/')) ||
+        n.links[0];
       if (best) lines.push(`  Best stable name: ${best.split(' -> ')[0]}`);
-      if (n.links.length) { lines.push('  Symlinks:'); for (const l of n.links) lines.push(`    ${l}`); }
+      if (n.links.length) {
+        lines.push('  Symlinks:');
+        for (const l of n.links) lines.push(`    ${l}`);
+      }
       if (n.block) lines.push(`  Block: ${n.block.type || ''} ${n.block.size || ''} ${n.block.fstype || ''} ${n.block.label || ''} ${(n.block.mountpoints || []).filter(Boolean).join(',')}`);
       lines.push('');
     }
+
   } else if (state.tab === 2) {
+    lines.push(...handleDetailLines(d));
+
+  } else if (state.tab === 3) {
     lines.push(bold('Driver / udev properties'), '');
     if (!activeNodes.length) lines.push('No /dev-backed udev properties found for this device.');
     for (const n of activeNodes) {
@@ -971,12 +986,14 @@ function detailLines(d) {
       for (const k of keys) if (n.props[k]) lines.push(`  ${rightPadRaw(k, 24)} ${n.props[k]}`);
       lines.push('');
     }
-  } else if (state.tab === 3) {
+
+  } else if (state.tab === 4) {
     lines.push(bold('Recent relevant kernel clues'), '');
     const relevant = state.lastKernel.filter(l => l.includes(`${Number(d.bus)}-`) || l.toLowerCase().includes((d.name || '').split(' ')[0]?.toLowerCase() || '___') || /usb|ttyUSB|ttyACM|disconnect|attached/i.test(l)).slice(-50);
     if (!relevant.length) lines.push('No recent matching kernel lines in dmesg tail.');
     else lines.push(...relevant);
-  } else if (state.tab === 4) {
+
+  } else if (state.tab === 5) {
     lines.push(bold(`Raw USB descriptor excerpt: lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`), '');
     lines.push('Press r to refresh. This tab loads on demand in the next version; current useful raw command:');
     lines.push(`  lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`);
