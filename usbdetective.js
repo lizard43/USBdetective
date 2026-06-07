@@ -896,8 +896,7 @@ function render() {
     out += left + sep + right + '\n';
   }
   out += '─'.repeat(cols) + '\n';
-  const scrollInfo = leftVisualRows.length > height ? `  |  tree ${state.leftScroll + 1}-${Math.min(leftVisualRows.length, state.leftScroll + height)}/${leftVisualRows.length}` : '';
-  out += pad((state.status || '') + scrollInfo, cols) + '\x1b[J';
+  out += pad((state.status || ''), cols) + '\x1b[J';
   process.stdout.write(out);
 }
 function fitPlainCell(s, width) {
