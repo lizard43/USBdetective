@@ -5,17 +5,15 @@
   No npm dependencies. Uses lsusb, udevadm, lsblk, dmesg, and optional v4l2-ctl.
 
   Keys:
-    Up/Down or j/k     Select device
+    Up/Down or j/k     Select USB device rows only
     PgUp/PgDn          Scroll details
     Left/Right         Previous/next detail tab
-    [ / ]              Previous/next detail tab
     1..6               Select detail tab
     r                  Refresh now
     q or Ctrl-C        Quit
 
   Mouse:
-    Click any device or child /dev row in the left pane to select that USB device
-    Wheel scrolls left tree when over left pane; details when over right pane
+    Disabled intentionally. Keyboard navigation is reliable and predictable.
 
   Env:
     USB_DETECTIVE_POLL_MS=1000
@@ -45,6 +43,7 @@ function red(s) { return color(C.red + C.bold, s); }
 function yellow(s) { return color(C.yellow + C.bold, s); }
 function cyan(s) { return color(C.cyan + C.bold, s); }
 function selected(s) { return USE_COLOR ? C.bgBlue + C.white + C.bold + s + C.reset : '>' + s.slice(1); }
+function dim(s) { return USE_COLOR ? '\x1b[2m' + s + C.reset : s; }
 function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, ''); }
 function visLen(s) { return stripAnsi(s).length; }
 function pad(s, width) { const n = visLen(s); return n >= width ? trunc(s, width) : s + ' '.repeat(width - n); }
@@ -264,9 +263,9 @@ async function poll(force = false) {
 }
 function selectedDevice() { return state.devices.find(d => d.key === state.selectedKey) || state.devices[0] || null; }
 function deviceLabel(d) {
-  const devs = (d.devNodes || []).map(n => n.path.replace('/dev/', '')).sort();
+  const devs = (d.devNodes || []).map(n => n.path).sort();
   const name = d.name || '(unnamed USB device)';
-  const devText = devs.length ? `  /dev: ${devs.join(', ')}` : '';
+  const devText = devs.length ? `  handles: ${devs.length}` : '';
   return `${d.key} ${d.vid}:${d.pid} ${name}${devText}`;
 }
 function buildRows() {
@@ -293,8 +292,8 @@ function buildRows() {
         selectKey:d.key,
         parentKey:d.key,
         device:d,
-        text:`${isLastDevice ? '   ' : '│  '} ${j === nodes.length - 1 ? '└─' : '├─'} /dev/${path.basename(n)}`,
-        selectable:true
+        text:`${isLastDevice ? '   ' : '│  '} ${j === nodes.length - 1 ? '└─' : '├─'} ${n}`,
+        selectable:false
       }));
     });
   }
@@ -302,22 +301,31 @@ function buildRows() {
 }
 
 function selectableRows(rows = buildRows()) {
-  // Keyboard navigation is row-level: device rows and child /dev rows are selectable.
-  // Selecting a child row still shows the parent USB device in the right pane.
-  return rows.filter(r => r.selectable);
+  // Keyboard navigation is device-level only.
+  // Child /dev rows are visible context, not stops in the Up/Down sequence.
+  return rows.filter(r => r.type === 'dev' && r.selectable);
 }
 
 function selectedRowIndex(rows = buildRows()) {
-  let idx = rows.findIndex(r => r.key === state.selectedRowKey);
+  let idx = rows.findIndex(r => r.type === 'dev' && r.key === state.selectedRowKey);
   if (idx < 0) idx = rows.findIndex(r => r.type === 'dev' && r.selectKey === state.selectedKey);
-  if (idx < 0) idx = rows.findIndex(r => r.selectKey === state.selectedKey);
   return idx < 0 ? 0 : idx;
 }
 
 function selectRow(row) {
-  if (!row || !row.selectable) return;
-  state.selectedRowKey = row.key;
-  state.selectedKey = row.selectKey || row.key;
+  if (!row) return;
+
+  // Device rows are the real selectable objects.
+  // Child /dev rows can be clicked, but they select their parent USB device.
+  let target = row;
+  if (row.type === 'node') {
+    const rows = buildRows();
+    target = rows.find(r => r.type === 'dev' && r.key === row.parentKey) || row;
+  }
+  if (!target.selectable || target.type !== 'dev') return;
+
+  state.selectedRowKey = target.key;
+  state.selectedKey = target.selectKey || target.key;
   state.detailScroll = 0;
 }
 
@@ -403,12 +411,66 @@ function suggestions(d) {
   } else if (nodes.some(n => /sd[a-z]|nvme/.test(n.path))) {
     lines.push('  Storage device: inspect filesystem/mount with lsblk -f.');
   } else if (/root hub/i.test(d.name)) {
-    lines.push('  Root hub: parent controller for devices on this USB bus. It normally has no useful /dev handle.');
+    lines.push(`  Root hub: logical top of USB Bus ${d.bus}. Devices on this bus are downstream from it, but the left tree is grouped by bus/device number, not true port nesting. Use the Topology tab for actual hub/port parent-child layout.`);
   } else {
     lines.push('  Check Driver tab for udev details and Topology tab for hub/port placement.');
   }
   return lines;
 }
+
+function wrapPlainForWidth(raw, width) {
+  raw = String(raw || '');
+  if (width <= 4 || raw.length <= width) return [raw];
+
+  const indentMatch = raw.match(/^\s*/);
+  const firstIndent = indentMatch ? indentMatch[0] : '';
+  const nextIndent = firstIndent + '  ';
+  const out = [];
+  let line = raw;
+  let currentIndent = firstIndent;
+
+  while (line.length > width) {
+    const available = Math.max(4, width - currentIndent.length);
+    let chunkSource = line.slice(currentIndent.length);
+
+    if (!chunkSource.trim()) {
+      out.push(line.slice(0, width));
+      line = currentIndent + line.slice(width).trimStart();
+      continue;
+    }
+
+    let cut = chunkSource.lastIndexOf(' ', available);
+    if (cut < Math.floor(available * 0.55)) cut = available;
+
+    const chunk = chunkSource.slice(0, cut).trimEnd();
+    out.push(currentIndent + chunk);
+
+    const rest = chunkSource.slice(cut).trimStart();
+    currentIndent = nextIndent;
+    line = currentIndent + rest;
+  }
+
+  out.push(line);
+  return out;
+}
+
+function wrapDetailLines(lines, width) {
+  const out = [];
+  for (const line of lines) {
+    if (visLen(line) <= width) {
+      out.push(line);
+      continue;
+    }
+
+    // Long detail text should wrap, not truncate. If the line contains ANSI
+    // styling, fall back to plain text for the wrapped continuation so ANSI
+    // escape sequences do not corrupt the terminal layout.
+    const raw = stripAnsi(line);
+    for (const wrapped of wrapPlainForWidth(raw, width)) out.push(wrapped);
+  }
+  return out;
+}
+
 function render() {
   const { cols, rows: termRows } = termSize();
   const leftW = Math.max(42, Math.min(72, Math.floor(cols * 0.45)));
@@ -421,22 +483,28 @@ function render() {
 
   let out = '\x1b[?25l\x1b[H';
   out += pad(cyan('USB Detective'), cols) + '\n';
-  out += pad(`Tree: ↑/↓ select row  ←/→ tabs  PgUp/PgDn scroll  r refresh  q quit`, cols) + '\n';
+  out += pad(`Tree: ↑/↓ select USB device  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  r refresh  q quit`, cols) + '\n';
   out += '─'.repeat(cols) + '\n';
 
   const d = selectedDevice();
   const details = detailLines(d);
   const tabLine = tabs.map((t,i) => i === state.tab ? `[${t}]` : ` ${t} `).join('  ');
   const detailHead = `${tabLine}`;
-  const detailBody = [detailHead, '─'.repeat(rightW), ...details].slice(state.detailScroll, state.detailScroll + height);
+  const detailBody = wrapDetailLines([detailHead, '─'.repeat(rightW), ...details], rightW).slice(state.detailScroll, state.detailScroll + height);
 
   const visibleLeft = rows.slice(state.leftScroll, state.leftScroll + height);
   for (let i = 0; i < height; i++) {
     const row = visibleLeft[i];
     const screenY = i + 4; // terminal rows are 1-based; content begins after 3 header rows
-    const leftRaw = row ? rowText(row) : '';
-    if (row && row.selectable) state.leftRowMap.set(screenY, row.key);
-    const left = pad(leftRaw, leftW);
+    if (row && (row.type === 'dev' || row.type === 'node')) state.leftRowMap.set(screenY, row.key);
+
+    // Build the visible left cell in two phases:
+    //   1) truncate/pad plain text to the pane width
+    //   2) apply color/highlight to the already-sized cell
+    // This matters because truncating an ANSI-colored selected row strips the
+    // highlight. Long rows like cameras/controllers were selected internally,
+    // but the blue selection vanished because pad() called trunc().
+    const left = row ? formatLeftCell(row, leftW) : ' '.repeat(leftW);
     const sep = ' │ ';
     const right = pad(detailBody[i] || '', rightW);
     out += left + sep + right + '\n';
@@ -446,18 +514,24 @@ function render() {
   out += pad((state.status || '') + scrollInfo, cols) + '\x1b[J';
   process.stdout.write(out);
 }
-function rowText(row) {
-  if (row.type === 'bus') return bold(row.text);
+function fitPlainCell(s, width) {
+  s = String(s || '');
+  if (s.length > width) return s.slice(0, Math.max(0, width - 1)) + '…';
+  return s + ' '.repeat(width - s.length);
+}
 
-  const isSel = row.key === state.selectedRowKey;
+function formatLeftCell(row, width) {
+  const isSel = row.type === 'dev' && row.key === state.selectedRowKey;
   const isNew = row.device && state.addedUntil.has(row.device.key);
   const isRemoved = row.device && row.device.removed;
-  let txt = row.text;
+  const cell = fitPlainCell(row.text, width);
 
-  if (isRemoved) txt = red(txt);
-  else if (isNew) txt = green(txt);
-  if (isSel) txt = selected(txt);
-  return txt;
+  if (isSel) return selected(cell);
+  if (row.type === 'bus') return bold(cell);
+  if (isRemoved) return red(cell);
+  if (isNew) return green(cell);
+  if (row.type === 'node') return dim(cell);
+  return cell;
 }
 function termSize() { return { cols: process.stdout.columns || 120, rows: process.stdout.rows || 36 }; }
 function selectDelta(delta) {
@@ -483,7 +557,7 @@ function scrollLeft(delta) {
   render();
 }
 function cleanup() {
-  process.stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[0m\n');
+  process.stdout.write('\x1b[?25h\x1b[0m\n');
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
 }
 function handleInput(buf) {
@@ -498,45 +572,14 @@ function handleInput(buf) {
   if (s === '\x1b[5~') { scrollDetail(-10); return; }
   if (s === '\x1b[1;5B') { scrollLeft(5); return; }
   if (s === '\x1b[1;5A') { scrollLeft(-5); return; }
-  if (s === ']') { setTab(state.tab + 1); return; }
-  if (s === '[') { setTab(state.tab - 1); return; }
   if (/^[1-6]$/.test(s)) { setTab(Number(s) - 1); return; }
 
-  const mouse = s.match(/\x1b\[<([0-9]+);([0-9]+);([0-9]+)([mM])/);
-  if (mouse) {
-    const code = Number(mouse[1]), x = Number(mouse[2]), y = Number(mouse[3]), up = mouse[4] === 'm';
-    const leftW = Math.max(42, Math.min(72, Math.floor((process.stdout.columns || 120) * 0.45)));
-    if (!up && code === 64) { // wheel up
-      if (x <= leftW) return scrollLeft(-3);
-      return scrollDetail(-3);
-    }
-    if (!up && code === 65) { // wheel down
-      if (x <= leftW) return scrollLeft(3);
-      return scrollDetail(3);
-    }
-    if (!up && y === 4 && x > leftW + 3) {
-      const labels = tabs.map((t,i)=> i===state.tab ? `[${t}]` : ` ${t} `);
-      let cur = leftW + 4;
-      for (let i=0;i<labels.length;i++) {
-        const w = labels[i].length + 2;
-        if (x >= cur && x < cur + labels[i].length) {
-          setTab(i);
-          return;
-        }
-        cur += labels[i].length + 2;
-      }
-    }
-    if (!up && x <= leftW) {
-      const rowKey = state.leftRowMap.get(y) || state.leftRowMap.get(y - 1) || state.leftRowMap.get(y + 1);
-      if (rowKey) {
-        const rows = buildRows();
-        const row = rows.find(r => r.key === rowKey);
-        selectRow(row);
-        ensureSelectedVisible(rows, Math.max(10, (process.stdout.rows || 36) - 4));
-        render();
-      }
-    }
-  }
+  // Mouse support is intentionally disabled. Terminal mouse coordinate reporting
+  // varies enough between terminal emulators, font scaling, title bars, and pane
+  // redraw timing that it was causing wrong-row/wrong-tab selection. Keep this
+  // TUI keyboard-first: Up/Down selects USB devices, Left/Right changes tabs,
+  // PgUp/PgDn scrolls details, Ctrl+Up/Ctrl+Down scrolls the left tree.
+
 }
 async function main() {
   process.on('exit', cleanup);
@@ -545,7 +588,7 @@ async function main() {
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.on('data', handleInput);
-    process.stdout.write('\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J');
+    process.stdout.write('\x1b[2J');
   }
   await poll(true);
   setInterval(() => poll(false), POLL_MS);
