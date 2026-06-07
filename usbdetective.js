@@ -436,7 +436,7 @@ function render() {
 function rowText(row) {
   if (row.type === 'bus') return bold(row.text);
 
-  const isSel = row.selectKey === state.selectedKey;
+  const isSel = (row.type === 'dev') && row.selectKey === state.selectedKey;
   const isNew = row.device && state.addedUntil.has(row.device.key);
   const isRemoved = row.device && row.device.removed;
   let txt = row.text;
@@ -498,6 +498,18 @@ function handleInput(buf) {
     if (!up && code === 65) { // wheel down
       if (x <= leftW) return scrollLeft(3);
       return scrollDetail(3);
+    }
+    if (!up && y === 4 && x > leftW + 3) {
+      const labels = tabs.map((t,i)=> i===state.tab ? `[${t}]` : ` ${t} `);
+      let cur = leftW + 4;
+      for (let i=0;i<labels.length;i++) {
+        const w = labels[i].length + 2;
+        if (x >= cur && x < cur + labels[i].length) {
+          setTab(i);
+          return;
+        }
+        cur += labels[i].length + 2;
+      }
     }
     if (!up && x <= leftW) {
       const key = state.leftRowMap.get(y);
