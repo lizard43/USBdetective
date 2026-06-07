@@ -319,19 +319,46 @@ function deviceLabel(d) {
   return `${d.key} ${d.vid}:${d.pid} ${name}`;
 }
 
+function topoDrivers(t) {
+  return [...new Set((t.interfaces || [])
+    .map(i => i.driver)
+    .filter(x => x && x !== '[none]'))];
+}
+
+function topoClasses(t) {
+  return [...new Set((t.interfaces || [])
+    .map(i => i.className)
+    .filter(Boolean))];
+}
+
 function topoSummaryForNode(t) {
   const bits = [];
-  if (t.port) bits.push(`P${String(t.port).padStart(3, '0')}`);
-  if (t.speed) bits.push(t.speed);
-  const drivers = [...new Set((t.interfaces || []).map(i => i.driver).filter(Boolean))];
-  if (drivers.length) bits.push(drivers.join('/'));
-  return bits.length ? `  ${bits.join(' ')}` : '';
+  if (t.port) bits.push(`Port ${String(t.port).padStart(3, '0')}`);
+  if (t.speed) bits.push(`Speed ${t.speed}`);
+  const drivers = topoDrivers(t);
+  if (drivers.length) bits.push(`Driver ${drivers.join('/')}`);
+  return bits.join('  ');
 }
 
 function devHandleSummary(d) {
   const count = (d.devNodes || []).length;
   if (!count) return '';
-  return `  handles:${count}`;
+  return `Handles ${count}`;
+}
+
+function deviceInfoLine(t, d) {
+  const id = d.vid && d.pid ? `${d.vid}:${d.pid}` : '????:????';
+  const bits = [`USB ${t.key}`, `ID ${id}`];
+  if (t.isRoot) bits.push('Root hub');
+  else {
+    const topo = topoSummaryForNode(t);
+    if (topo) bits.push(topo);
+  }
+  const classes = topoClasses(t).filter(c => c && !/root hub/i.test(c));
+  if (classes.length) bits.push(`Class ${classes.join('/')}`);
+  const handles = devHandleSummary(d);
+  if (handles) bits.push(handles);
+  return bits.join('  ');
 }
 
 function buildFallbackRows() {
@@ -343,13 +370,23 @@ function buildFallbackRows() {
     list.forEach((d, i) => {
       const isLastDevice = i === list.length - 1;
       const branch = isLastDevice ? '└─' : '├─';
+      const childPrefix = isLastDevice ? '   ' : '│  ';
       rows.push({
         type:'dev',
         key:d.key,
         selectKey:d.key,
         device:d,
-        text:`${branch} ${deviceLabel(d)}${devHandleSummary(d)}`,
+        text:`${branch} ${d.name || '(unnamed USB device)'}`,
         selectable:true
+      });
+      rows.push({
+        type:'meta',
+        key:`${d.key}:meta`,
+        selectKey:d.key,
+        parentKey:d.key,
+        device:d,
+        text:`${childPrefix}   USB ${d.key}  ID ${d.vid}:${d.pid}${d.devNodes && d.devNodes.length ? `  Handles ${d.devNodes.length}` : ''}`,
+        selectable:false
       });
       const nodes = (d.devNodes || []).map(n => n.path).sort();
       nodes.forEach((n, j) => rows.push({
@@ -358,7 +395,7 @@ function buildFallbackRows() {
         selectKey:d.key,
         parentKey:d.key,
         device:d,
-        text:`${isLastDevice ? '   ' : '│  '} ${j === nodes.length - 1 ? '└─' : '├─'} ${n}`,
+        text:`${childPrefix}${j === nodes.length - 1 ? '└─' : '├─'} ${n}`,
         selectable:false
       }));
     });
@@ -491,10 +528,7 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
   const d = t.device;
   const branch = isLast ? '└─' : '├─';
   const name = d.name || t.className || '(unnamed USB device)';
-  const id = d.vid && d.pid ? `${d.vid}:${d.pid}` : '????:????';
-  const rootTag = t.isRoot ? 'root' : topoSummaryForNode(t);
-  const topoBits = rootTag ? `  ${rootTag}` : '';
-  const text = `${prefix}${branch} ${t.key} ${id} ${name}${topoBits}${devHandleSummary(d)}`;
+  const text = `${prefix}${branch} ${name}`;
   rows.push({
     type:'dev',
     key:t.key,
@@ -506,6 +540,17 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
   });
 
   const childPrefix = prefix + (isLast ? '   ' : '│  ');
+  rows.push({
+    type:'meta',
+    key:`${t.key}:meta`,
+    selectKey:t.key,
+    parentKey:t.key,
+    device:d,
+    topo:t,
+    text:`${childPrefix}   ${deviceInfoLine(t, d)}`,
+    selectable:false
+  });
+
   const children = t.children || [];
   const nodes = (d.devNodes || []).map(n => n.path).sort();
 
@@ -561,7 +606,7 @@ function buildRows() {
         key:d.key,
         selectKey:d.key,
         device:d,
-        text:`${isLast ? '└─' : '├─'} ${deviceLabel(d)}${devHandleSummary(d)}`,
+        text:`${isLast ? '└─' : '├─'} ${d.name || '(unnamed USB device)'}`,
         selectable:true
       });
     });
@@ -848,7 +893,7 @@ function formatLeftVisualCell(vrow, width) {
   if (row.type === 'bus') return bold(cell);
   if (isRemoved) return red(cell);
   if (isNew) return green(cell);
-  if (row.type === 'node') return dim(cell);
+  if (row.type === 'node' || row.type === 'meta') return dim(cell);
   return cell;
 }
 function termSize() { return { cols: process.stdout.columns || 120, rows: process.stdout.rows || 36 }; }
