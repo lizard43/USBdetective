@@ -932,6 +932,71 @@ function handleDetailLines(d) {
   return lines;
 }
 
+
+function driverSummaryValue(n, key) {
+  return (n.props && n.props[key]) ? n.props[key] : '';
+}
+
+function driverDetailLines(d) {
+  const lines = [];
+  const activeNodes = d.devNodes || [];
+
+  lines.push(bold('Driver / udev properties'), '');
+  lines.push('Top summary shows every /dev handle for the selected USB device. Detailed udev properties follow below.');
+  lines.push('Use PgUp/PgDn to scroll this pane.');
+  lines.push('');
+
+  if (!activeNodes.length) {
+    lines.push('No /dev-backed udev properties found for this device.');
+    return lines;
+  }
+
+  lines.push(bold(`Handle summary (${activeNodes.length})`));
+  lines.push('  #   NODE                    IF  SUBSYSTEM  DRIVER        MODEL');
+  activeNodes.forEach((n, idx) => {
+    const iface = driverSummaryValue(n, 'ID_USB_INTERFACE_NUM') || '-';
+    const subsystem = driverSummaryValue(n, 'SUBSYSTEM') || '-';
+    const driver = driverSummaryValue(n, 'ID_USB_DRIVER') || driverSummaryValue(n, 'DRIVER') || '-';
+    const model = driverSummaryValue(n, 'ID_MODEL_FROM_DATABASE') || driverSummaryValue(n, 'ID_MODEL') || '-';
+    lines.push(`  ${rightPadRaw(idx + 1, 3)} ${rightPadRaw(n.path, 23)} ${rightPadRaw(iface, 3)} ${rightPadRaw(subsystem, 10)} ${rightPadRaw(driver, 13)} ${model}`);
+  });
+  lines.push('');
+
+  const keyGroups = [
+    ['Core', ['SUBSYSTEM','DEVTYPE','ID_BUS','ID_USB_DRIVER','DRIVER','ID_USB_INTERFACE_NUM']],
+    ['Identity', ['ID_VENDOR','ID_VENDOR_FROM_DATABASE','ID_VENDOR_ID','ID_MODEL','ID_MODEL_FROM_DATABASE','ID_MODEL_ID','ID_SERIAL','ID_SERIAL_SHORT']],
+    ['Path', ['ID_PATH','DEVPATH','TAGS']]
+  ];
+
+  activeNodes.forEach((n, idx) => {
+    lines.push(bold(`${idx + 1}/${activeNodes.length}  ${n.path}`));
+
+    for (const [groupName, keys] of keyGroups) {
+      const present = keys.filter(k => n.props[k]);
+      if (!present.length) continue;
+      lines.push(`  ${groupName}:`);
+      for (const k of present) {
+        lines.push(`    ${rightPadRaw(k, 24)} ${n.props[k]}`);
+      }
+    }
+
+    const extraKeys = Object.keys(n.props || {})
+      .filter(k => /^ID_INPUT|^ID_FOR_SEAT|^USEC_INITIALIZED|^MAJOR$|^MINOR$|^DEVNAME$/.test(k))
+      .sort();
+
+    if (extraKeys.length) {
+      lines.push('  Extra:');
+      for (const k of extraKeys) {
+        lines.push(`    ${rightPadRaw(k, 24)} ${n.props[k]}`);
+      }
+    }
+
+    lines.push('');
+  });
+
+  return lines;
+}
+
 function detailLines(d) {
   if (!d) return ['No USB devices found.'];
   const lines = [];
@@ -978,14 +1043,7 @@ function detailLines(d) {
     lines.push(...handleDetailLines(d));
 
   } else if (state.tab === 3) {
-    lines.push(bold('Driver / udev properties'), '');
-    if (!activeNodes.length) lines.push('No /dev-backed udev properties found for this device.');
-    for (const n of activeNodes) {
-      lines.push(bold(n.path));
-      const keys = ['SUBSYSTEM','DEVTYPE','ID_BUS','ID_USB_DRIVER','DRIVER','ID_VENDOR','ID_VENDOR_FROM_DATABASE','ID_VENDOR_ID','ID_MODEL','ID_MODEL_FROM_DATABASE','ID_MODEL_ID','ID_SERIAL','ID_SERIAL_SHORT','ID_USB_INTERFACE_NUM','ID_PATH','DEVPATH','TAGS'];
-      for (const k of keys) if (n.props[k]) lines.push(`  ${rightPadRaw(k, 24)} ${n.props[k]}`);
-      lines.push('');
-    }
+    lines.push(...driverDetailLines(d));
 
   } else if (state.tab === 4) {
     lines.push(bold('Recent relevant kernel clues'), '');
