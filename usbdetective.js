@@ -13,8 +13,8 @@
     q or Ctrl-C        Quit
 
   Mouse:
-    Click left pane rows to select
-    Wheel scrolls details
+    Click any device or child /dev row in the left pane to select that USB device
+    Wheel scrolls left tree when over left pane; details when over right pane
 
   Env:
     USB_DETECTIVE_POLL_MS=1000
@@ -69,7 +69,7 @@ function run(cmd, args = [], opts = {}) {
 async function sh(command, opts = {}) { return run('bash', ['-lc', command], opts); }
 
 let state = {
-  devices: [], rows: [], selectedKey: null, selectedIndex: 0, detailScroll: 0, tab: 0,
+  devices: [], rows: [], selectedKey: null, selectedIndex: 0, detailScroll: 0, leftScroll: 0, tab: 0,
   previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
   leftRowMap: new Map(), lastPollAt: null
@@ -229,7 +229,7 @@ function mergedDevices(devices) {
   return out.sort((a,b) => a.bus.localeCompare(b.bus) || Number(a.dev) - Number(b.dev));
 }
 function signature(snap) {
-  return JSON.stringify({ d: snap.devices.map(d => [d.key, d.vid, d.pid, d.name, d.devNodes.map(n => n.path).sort()]), r: [...state.removedDevices.keys()].sort(), tab: state.tab, sel: state.selectedKey, scroll: state.detailScroll, size: termSize() });
+  return JSON.stringify({ d: snap.devices.map(d => [d.key, d.vid, d.pid, d.name, d.devNodes.map(n => n.path).sort()]), r: [...state.removedDevices.keys()].sort(), tab: state.tab, sel: state.selectedKey, scroll: state.detailScroll, leftScroll: state.leftScroll, size: termSize() });
 }
 async function poll(force = false) {
   if (state.polling) return;
@@ -245,6 +245,7 @@ async function poll(force = false) {
       state.selectedKey = state.devices[0] ? state.devices[0].key : null;
       state.selectedIndex = 0;
       state.detailScroll = 0;
+      state.leftScroll = 0;
     } else {
       state.selectedIndex = Math.max(0, state.devices.findIndex(d => d.key === state.selectedKey));
     }
@@ -270,14 +271,52 @@ function buildRows() {
     rows.push({ type:'bus', key:`bus:${bus}`, text:`USB Bus ${bus}`, selectable:false });
     const list = state.devices.filter(d => d.bus === bus).sort((a,b) => Number(a.dev) - Number(b.dev));
     list.forEach((d, i) => {
-      const branch = i === list.length - 1 ? '└─' : '├─';
-      rows.push({ type:'dev', key:d.key, device:d, text:`${branch} ${deviceLabel(d)}`, selectable:true });
+      const isLastDevice = i === list.length - 1;
+      const branch = isLastDevice ? '└─' : '├─';
+      rows.push({
+        type:'dev',
+        key:d.key,
+        selectKey:d.key,
+        device:d,
+        text:`${branch} ${deviceLabel(d)}`,
+        selectable:true
+      });
       const nodes = (d.devNodes || []).map(n => n.path).sort();
-      nodes.forEach((n, j) => rows.push({ type:'node', key:`${d.key}:${n}`, parentKey:d.key, text:`${i === list.length - 1 ? '   ' : '│  '} ${j === nodes.length - 1 ? '└' : '├'} /dev/${path.basename(n)}`, selectable:false }));
+      nodes.forEach((n, j) => rows.push({
+        type:'node',
+        key:`${d.key}:${n}`,
+        selectKey:d.key,
+        parentKey:d.key,
+        device:d,
+        text:`${isLastDevice ? '   ' : '│  '} ${j === nodes.length - 1 ? '└─' : '├─'} /dev/${path.basename(n)}`,
+        selectable:true
+      }));
     });
   }
   return rows;
 }
+
+function selectableDeviceRows(rows = buildRows()) {
+  // Keyboard navigation is device-level, not child-node-level.
+  // Child /dev rows are clickable and select their parent, but arrows step device-to-device.
+  return rows.filter(r => r.type === 'dev' && r.selectable);
+}
+
+function selectedRowIndex(rows = buildRows()) {
+  let idx = rows.findIndex(r => r.type === 'dev' && r.selectKey === state.selectedKey);
+  if (idx < 0) idx = rows.findIndex(r => r.selectKey === state.selectedKey);
+  return idx < 0 ? 0 : idx;
+}
+
+function ensureSelectedVisible(rows, height) {
+  const idx = selectedRowIndex(rows);
+  if (idx < state.leftScroll) state.leftScroll = idx;
+  if (idx >= state.leftScroll + height) state.leftScroll = Math.max(0, idx - height + 1);
+  const maxScroll = Math.max(0, rows.length - height);
+  if (state.leftScroll > maxScroll) state.leftScroll = maxScroll;
+  if (state.leftScroll < 0) state.leftScroll = 0;
+}
+
 function detailLines(d) {
   if (!d) return ['No USB devices found.'];
   const lines = [];
@@ -363,36 +402,45 @@ function render() {
   const rightW = Math.max(20, cols - leftW - 3);
   const height = Math.max(10, termRows - 4);
   const rows = buildRows();
+  ensureSelectedVisible(rows, height);
   state.rows = rows;
   state.leftRowMap.clear();
+
   let out = '\x1b[?25l\x1b[H';
   out += pad(cyan('USB Detective'), cols) + '\n';
   out += pad(`Tree: ↑/↓ select  [/] tabs  PgUp/PgDn scroll  r refresh  q quit`, cols) + '\n';
   out += '─'.repeat(cols) + '\n';
+
   const d = selectedDevice();
   const details = detailLines(d);
   const tabLine = tabs.map((t,i) => i === state.tab ? `[${t}]` : ` ${t} `).join('  ');
   const detailHead = `${tabLine}`;
   const detailBody = [detailHead, '─'.repeat(rightW), ...details].slice(state.detailScroll, state.detailScroll + height);
+
+  const visibleLeft = rows.slice(state.leftScroll, state.leftScroll + height);
   for (let i = 0; i < height; i++) {
-    const leftRaw = rows[i] ? rowText(rows[i], i) : '';
-    if (rows[i] && rows[i].selectable) state.leftRowMap.set(i + 4, rows[i].key);
+    const row = visibleLeft[i];
+    const screenY = i + 4; // terminal rows are 1-based; content begins after 3 header rows
+    const leftRaw = row ? rowText(row) : '';
+    if (row && row.selectable) state.leftRowMap.set(screenY, row.selectKey || row.key);
     const left = pad(leftRaw, leftW);
     const sep = ' │ ';
     const right = pad(detailBody[i] || '', rightW);
     out += left + sep + right + '\n';
   }
   out += '─'.repeat(cols) + '\n';
-  out += pad(state.status || '', cols) + '\x1b[J';
+  const scrollInfo = rows.length > height ? `  |  left ${state.leftScroll + 1}-${Math.min(rows.length, state.leftScroll + height)}/${rows.length}` : '';
+  out += pad((state.status || '') + scrollInfo, cols) + '\x1b[J';
   process.stdout.write(out);
 }
 function rowText(row) {
   if (row.type === 'bus') return bold(row.text);
-  if (row.type === 'node') return row.text;
-  const isSel = row.key === state.selectedKey;
-  const isNew = state.addedUntil.has(row.key);
+
+  const isSel = row.selectKey === state.selectedKey;
+  const isNew = row.device && state.addedUntil.has(row.device.key);
   const isRemoved = row.device && row.device.removed;
   let txt = row.text;
+
   if (isRemoved) txt = red(txt);
   else if (isNew) txt = green(txt);
   if (isSel) txt = selected(txt);
@@ -400,18 +448,27 @@ function rowText(row) {
 }
 function termSize() { return { cols: process.stdout.columns || 120, rows: process.stdout.rows || 36 }; }
 function selectDelta(delta) {
-  const selectable = state.rows.filter(r => r.selectable);
+  const rows = buildRows();
+  const selectable = selectableDeviceRows(rows);
   if (!selectable.length) return;
-  let idx = selectable.findIndex(r => r.key === state.selectedKey);
+  let idx = selectable.findIndex(r => r.selectKey === state.selectedKey || r.key === state.selectedKey);
   if (idx < 0) idx = 0;
   idx = Math.max(0, Math.min(selectable.length - 1, idx + delta));
-  state.selectedKey = selectable[idx].key;
+  state.selectedKey = selectable[idx].selectKey || selectable[idx].key;
   state.selectedIndex = idx;
   state.detailScroll = 0;
+  ensureSelectedVisible(rows, Math.max(10, (process.stdout.rows || 36) - 4));
   render();
 }
 function setTab(t) { state.tab = Math.max(0, Math.min(tabs.length - 1, t)); state.detailScroll = 0; render(); }
 function scrollDetail(delta) { state.detailScroll = Math.max(0, state.detailScroll + delta); render(); }
+function scrollLeft(delta) {
+  const rows = buildRows();
+  const height = Math.max(10, (process.stdout.rows || 36) - 4);
+  const maxScroll = Math.max(0, rows.length - height);
+  state.leftScroll = Math.max(0, Math.min(maxScroll, state.leftScroll + delta));
+  render();
+}
 function cleanup() {
   process.stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[0m\n');
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
@@ -424,17 +481,33 @@ function handleInput(buf) {
   if (s === 'k' || s === '\x1b[A') { selectDelta(-1); return; }
   if (s === '\x1b[6~') { scrollDetail(10); return; }
   if (s === '\x1b[5~') { scrollDetail(-10); return; }
+  if (s === '\x1b[1;5B') { scrollLeft(5); return; }
+  if (s === '\x1b[1;5A') { scrollLeft(-5); return; }
   if (s === ']') { setTab(state.tab + 1); return; }
   if (s === '[') { setTab(state.tab - 1); return; }
   if (/^[1-6]$/.test(s)) { setTab(Number(s) - 1); return; }
+
   const mouse = s.match(/\x1b\[<([0-9]+);([0-9]+);([0-9]+)([mM])/);
   if (mouse) {
     const code = Number(mouse[1]), x = Number(mouse[2]), y = Number(mouse[3]), up = mouse[4] === 'm';
-    if (!up && code === 64) return scrollDetail(-3);
-    if (!up && code === 65) return scrollDetail(3);
-    if (!up && x <= Math.max(42, Math.min(72, Math.floor((process.stdout.columns || 120) * 0.45)))) {
+    const leftW = Math.max(42, Math.min(72, Math.floor((process.stdout.columns || 120) * 0.45)));
+    if (!up && code === 64) { // wheel up
+      if (x <= leftW) return scrollLeft(-3);
+      return scrollDetail(-3);
+    }
+    if (!up && code === 65) { // wheel down
+      if (x <= leftW) return scrollLeft(3);
+      return scrollDetail(3);
+    }
+    if (!up && x <= leftW) {
       const key = state.leftRowMap.get(y);
-      if (key) { state.selectedKey = key; state.detailScroll = 0; render(); }
+      if (key) {
+        state.selectedKey = key;
+        state.detailScroll = 0;
+        const rows = buildRows();
+        ensureSelectedVisible(rows, Math.max(10, (process.stdout.rows || 36) - 4));
+        render();
+      }
     }
   }
 }
