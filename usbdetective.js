@@ -7,6 +7,7 @@
   Keys:
     Up/Down or j/k     Select device
     PgUp/PgDn          Scroll details
+    Left/Right         Previous/next detail tab
     [ / ]              Previous/next detail tab
     1..6               Select detail tab
     r                  Refresh now
@@ -69,7 +70,7 @@ function run(cmd, args = [], opts = {}) {
 async function sh(command, opts = {}) { return run('bash', ['-lc', command], opts); }
 
 let state = {
-  devices: [], rows: [], selectedKey: null, selectedIndex: 0, detailScroll: 0, leftScroll: 0, tab: 0,
+  devices: [], rows: [], selectedKey: null, selectedRowKey: null, selectedIndex: 0, detailScroll: 0, leftScroll: 0, tab: 0,
   previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
   leftRowMap: new Map(), lastPollAt: null
@@ -229,7 +230,7 @@ function mergedDevices(devices) {
   return out.sort((a,b) => a.bus.localeCompare(b.bus) || Number(a.dev) - Number(b.dev));
 }
 function signature(snap) {
-  return JSON.stringify({ d: snap.devices.map(d => [d.key, d.vid, d.pid, d.name, d.devNodes.map(n => n.path).sort()]), r: [...state.removedDevices.keys()].sort(), tab: state.tab, sel: state.selectedKey, scroll: state.detailScroll, leftScroll: state.leftScroll, size: termSize() });
+  return JSON.stringify({ d: snap.devices.map(d => [d.key, d.vid, d.pid, d.name, d.devNodes.map(n => n.path).sort()]), r: [...state.removedDevices.keys()].sort(), tab: state.tab, sel: state.selectedKey, row: state.selectedRowKey, scroll: state.detailScroll, leftScroll: state.leftScroll, size: termSize() });
 }
 async function poll(force = false) {
   if (state.polling) return;
@@ -243,11 +244,15 @@ async function poll(force = false) {
     state.lastPollAt = snap.when;
     if (!state.selectedKey || !state.devices.some(d => d.key === state.selectedKey)) {
       state.selectedKey = state.devices[0] ? state.devices[0].key : null;
+      state.selectedRowKey = state.selectedKey;
       state.selectedIndex = 0;
       state.detailScroll = 0;
       state.leftScroll = 0;
     } else {
       state.selectedIndex = Math.max(0, state.devices.findIndex(d => d.key === state.selectedKey));
+      if (!state.selectedRowKey || !buildRows().some(r => r.key === state.selectedRowKey || r.selectKey === state.selectedRowKey)) {
+        state.selectedRowKey = state.selectedKey;
+      }
     }
     state.status = `Updated ${snap.when.toLocaleTimeString()}  |  ${snap.devices.length} active USB devices`;
     const sig = signature(snap);
@@ -296,16 +301,24 @@ function buildRows() {
   return rows;
 }
 
-function selectableDeviceRows(rows = buildRows()) {
-  // Keyboard navigation is device-level, not child-node-level.
-  // Child /dev rows are clickable and select their parent, but arrows step device-to-device.
-  return rows.filter(r => r.type === 'dev' && r.selectable);
+function selectableRows(rows = buildRows()) {
+  // Keyboard navigation is row-level: device rows and child /dev rows are selectable.
+  // Selecting a child row still shows the parent USB device in the right pane.
+  return rows.filter(r => r.selectable);
 }
 
 function selectedRowIndex(rows = buildRows()) {
-  let idx = rows.findIndex(r => r.type === 'dev' && r.selectKey === state.selectedKey);
+  let idx = rows.findIndex(r => r.key === state.selectedRowKey);
+  if (idx < 0) idx = rows.findIndex(r => r.type === 'dev' && r.selectKey === state.selectedKey);
   if (idx < 0) idx = rows.findIndex(r => r.selectKey === state.selectedKey);
   return idx < 0 ? 0 : idx;
+}
+
+function selectRow(row) {
+  if (!row || !row.selectable) return;
+  state.selectedRowKey = row.key;
+  state.selectedKey = row.selectKey || row.key;
+  state.detailScroll = 0;
 }
 
 function ensureSelectedVisible(rows, height) {
@@ -408,7 +421,7 @@ function render() {
 
   let out = '\x1b[?25l\x1b[H';
   out += pad(cyan('USB Detective'), cols) + '\n';
-  out += pad(`Tree: ↑/↓ select  [/] tabs  PgUp/PgDn scroll  r refresh  q quit`, cols) + '\n';
+  out += pad(`Tree: ↑/↓ select row  ←/→ tabs  PgUp/PgDn scroll  r refresh  q quit`, cols) + '\n';
   out += '─'.repeat(cols) + '\n';
 
   const d = selectedDevice();
@@ -422,7 +435,7 @@ function render() {
     const row = visibleLeft[i];
     const screenY = i + 4; // terminal rows are 1-based; content begins after 3 header rows
     const leftRaw = row ? rowText(row) : '';
-    if (row && row.selectable) state.leftRowMap.set(screenY, row.selectKey || row.key);
+    if (row && row.selectable) state.leftRowMap.set(screenY, row.key);
     const left = pad(leftRaw, leftW);
     const sep = ' │ ';
     const right = pad(detailBody[i] || '', rightW);
@@ -436,7 +449,7 @@ function render() {
 function rowText(row) {
   if (row.type === 'bus') return bold(row.text);
 
-  const isSel = (row.type === 'dev') && row.selectKey === state.selectedKey;
+  const isSel = row.key === state.selectedRowKey;
   const isNew = row.device && state.addedUntil.has(row.device.key);
   const isRemoved = row.device && row.device.removed;
   let txt = row.text;
@@ -449,14 +462,14 @@ function rowText(row) {
 function termSize() { return { cols: process.stdout.columns || 120, rows: process.stdout.rows || 36 }; }
 function selectDelta(delta) {
   const rows = buildRows();
-  const selectable = selectableDeviceRows(rows);
+  const selectable = selectableRows(rows);
   if (!selectable.length) return;
-  let idx = selectable.findIndex(r => r.selectKey === state.selectedKey || r.key === state.selectedKey);
+  let idx = selectable.findIndex(r => r.key === state.selectedRowKey);
+  if (idx < 0) idx = selectable.findIndex(r => r.selectKey === state.selectedKey);
   if (idx < 0) idx = 0;
   idx = Math.max(0, Math.min(selectable.length - 1, idx + delta));
-  state.selectedKey = selectable[idx].selectKey || selectable[idx].key;
+  selectRow(selectable[idx]);
   state.selectedIndex = idx;
-  state.detailScroll = 0;
   ensureSelectedVisible(rows, Math.max(10, (process.stdout.rows || 36) - 4));
   render();
 }
@@ -479,6 +492,8 @@ function handleInput(buf) {
   if (s === 'r') { poll(true); return; }
   if (s === 'j' || s === '\x1b[B') { selectDelta(1); return; }
   if (s === 'k' || s === '\x1b[A') { selectDelta(-1); return; }
+  if (s === '\x1b[C') { setTab(state.tab + 1); return; }
+  if (s === '\x1b[D') { setTab(state.tab - 1); return; }
   if (s === '\x1b[6~') { scrollDetail(10); return; }
   if (s === '\x1b[5~') { scrollDetail(-10); return; }
   if (s === '\x1b[1;5B') { scrollLeft(5); return; }
@@ -512,11 +527,11 @@ function handleInput(buf) {
       }
     }
     if (!up && x <= leftW) {
-      const key = state.leftRowMap.get(y);
-      if (key) {
-        state.selectedKey = key;
-        state.detailScroll = 0;
+      const rowKey = state.leftRowMap.get(y) || state.leftRowMap.get(y - 1) || state.leftRowMap.get(y + 1);
+      if (rowKey) {
         const rows = buildRows();
+        const row = rows.find(r => r.key === rowKey);
+        selectRow(row);
         ensureSelectedVisible(rows, Math.max(10, (process.stdout.rows || 36) - 4));
         render();
       }
