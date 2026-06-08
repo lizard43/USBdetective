@@ -1829,7 +1829,7 @@ function ensureSelectedVisualVisible(visualRows, height) {
 
 
 function titleHelpLine() {
-  const title = titleGreen(APP_TITLE);
+  const title = cyan(APP_TITLE);
   if (!state.showKeys) return `${title} —  press k for keyboard mappings`;
 
   return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit`;
@@ -1841,7 +1841,7 @@ function render() {
   if (!state.lastPollAt && !state.devices.length) {
     const { cols, rows } = termSize();
     let out = '\x1b[?25l\x1b[H';
-    out += pad(titleGreen(APP_TITLE + ' '), cols) + '\n';
+    out += pad(cyan(APP_TITLE + ' '), cols) + '\n';
     out += '─'.repeat(cols) + '\n';
     out += '\n';
     out += pad(state.startupMessage, cols) + '\n';
