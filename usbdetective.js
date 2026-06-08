@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.13';
+const APP_VERSION = 'v20260608.15';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 // Heavy handle detection can walk /proc and run lsof/fuser.
@@ -113,12 +113,13 @@ let state = {
   previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
   leftRowMap: new Map(), lastPollAt: null,
-  sniff: { fd: null, path: '', kind: '', active: false, opening: false, lines: [], bytes: 0, reads: 0, error: '', failPath: '', targetIndex: 0 }
+  sniff: { fd: null, path: '', kind: '', active: false, opening: false, lines: [], bytes: 0, reads: 0, error: '', failPath: '', targetIndex: 0, viewMode: 'smart', partial: Buffer.alloc(0) }
 };
 const tabs = ['Summary', '/dev', 'Handles', 'Driver', 'Kernel', 'Raw USB'];
 
 const SNIFF_MAX_LINES = 500;
 const SNIFF_READ_SIZE = 64;
+const SNIFF_VIEW_MODES = ['smart', 'hex', 'ascii', 'both'];
 
 function sniffableNodesForDevice(d) {
   if (!d) return [];
@@ -133,11 +134,101 @@ function sniffableNodesForDevice(d) {
   return out;
 }
 
+function bytesToHex(buf) {
+  return [...Buffer.from(buf || [])].map(x => x.toString(16).padStart(2, '0')).join(' ');
+}
+
+function bytesToAscii(buf) {
+  return [...Buffer.from(buf || [])].map(x => x >= 32 && x <= 126 ? String.fromCharCode(x) : '.').join('');
+}
+
 function hexDump(buf) {
   const b = Buffer.from(buf || []);
-  const hex = [...b].map(x => x.toString(16).padStart(2, '0')).join(' ');
-  const asc = [...b].map(x => x >= 32 && x <= 126 ? String.fromCharCode(x) : '.').join('');
-  return `${hex}  |${asc}|`;
+  return `${bytesToHex(b)}  |${bytesToAscii(b)}|`;
+}
+
+const EV_TYPE_NAMES = {
+  0: 'EV_SYN', 1: 'EV_KEY', 2: 'EV_REL', 3: 'EV_ABS', 4: 'EV_MSC', 17: 'EV_LED'
+};
+const EV_KEY_NAMES = {
+  1:'ESC', 2:'1', 3:'2', 4:'3', 5:'4', 6:'5', 7:'6', 8:'7', 9:'8', 10:'9', 11:'0',
+  12:'MINUS', 13:'EQUAL', 14:'BACKSPACE', 15:'TAB', 16:'Q', 17:'W', 18:'E', 19:'R', 20:'T', 21:'Y', 22:'U', 23:'I', 24:'O', 25:'P',
+  26:'LEFTBRACE', 27:'RIGHTBRACE', 28:'ENTER', 29:'LEFTCTRL', 30:'A', 31:'S', 32:'D', 33:'F', 34:'G', 35:'H', 36:'J', 37:'K', 38:'L',
+  39:'SEMICOLON', 40:'APOSTROPHE', 41:'GRAVE', 42:'LEFTSHIFT', 43:'BACKSLASH', 44:'Z', 45:'X', 46:'C', 47:'V', 48:'B', 49:'N', 50:'M',
+  51:'COMMA', 52:'DOT', 53:'SLASH', 54:'RIGHTSHIFT', 56:'LEFTALT', 57:'SPACE', 58:'CAPSLOCK',
+  97:'RIGHTCTRL', 100:'RIGHTALT', 103:'UP', 105:'LEFT', 106:'RIGHT', 108:'DOWN', 110:'INSERT', 111:'DELETE',
+  272:'BTN_LEFT', 273:'BTN_RIGHT', 274:'BTN_MIDDLE', 275:'BTN_SIDE', 276:'BTN_EXTRA'
+};
+const EV_REL_NAMES = { 0:'REL_X', 1:'REL_Y', 6:'REL_HWHEEL', 8:'REL_WHEEL' };
+const EV_ABS_NAMES = { 0:'ABS_X', 1:'ABS_Y', 2:'ABS_Z', 3:'ABS_RX', 4:'ABS_RY', 5:'ABS_RZ', 16:'ABS_HAT0X', 17:'ABS_HAT0Y' };
+
+function inputEventCodeName(type, code) {
+  if (type === 1) return EV_KEY_NAMES[code] || `KEY_${code}`;
+  if (type === 2) return EV_REL_NAMES[code] || `REL_${code}`;
+  if (type === 3) return EV_ABS_NAMES[code] || `ABS_${code}`;
+  if (type === 0 && code === 0) return 'SYN_REPORT';
+  return `CODE_${code}`;
+}
+
+function inputEventValueText(type, value) {
+  if (type === 1) {
+    if (value === 0) return 'up';
+    if (value === 1) return 'down';
+    if (value === 2) return 'repeat';
+  }
+  return String(value);
+}
+
+function decodeInputEventChunk(chunk) {
+  const b = Buffer.concat([state.sniff.partial || Buffer.alloc(0), Buffer.from(chunk || [])]);
+  const eventSize = 24; // 64-bit Linux input_event: timeval(16) + type(2) + code(2) + value(4)
+  const out = [];
+  let off = 0;
+  while (off + eventSize <= b.length) {
+    let sec = 0, usec = 0;
+    try {
+      sec = Number(b.readBigInt64LE(off));
+      usec = Number(b.readBigInt64LE(off + 8));
+    } catch {
+      sec = b.readUInt32LE(off);
+      usec = b.readUInt32LE(off + 8);
+    }
+    const type = b.readUInt16LE(off + 16);
+    const code = b.readUInt16LE(off + 18);
+    const value = b.readInt32LE(off + 20);
+    const typeName = EV_TYPE_NAMES[type] || `EV_${type}`;
+    const codeName = inputEventCodeName(type, code);
+    const valueText = inputEventValueText(type, value);
+    out.push(`${typeName} ${rightPadRaw(codeName, 12)} value ${rightPadRaw(valueText, 7)} t ${sec}.${String(usec).padStart(6, '0')}`);
+    off += eventSize;
+  }
+  state.sniff.partial = b.subarray(off);
+  return out;
+}
+
+function formatSniffChunk(chunk) {
+  const b = Buffer.from(chunk || []);
+  const mode = state.sniff.viewMode || 'smart';
+  const isInputEvent = /^\/dev\/input\/event\d+$/.test(state.sniff.path || '');
+
+  if (mode === 'hex') return `${rightPadRaw(b.length, 4)} bytes  ${bytesToHex(b)}`;
+  if (mode === 'ascii') return `${rightPadRaw(b.length, 4)} bytes  ascii |${bytesToAscii(b)}|`;
+  if (mode === 'both') return `${rightPadRaw(b.length, 4)} bytes  ${hexDump(b)}`;
+
+  if (isInputEvent) {
+    const decoded = decodeInputEventChunk(b);
+    if (decoded.length) return `${rightPadRaw(b.length, 4)} bytes  ${decoded.join(' ; ')}`;
+    return `${rightPadRaw(b.length, 4)} bytes  waiting for full input_event (${(state.sniff.partial || Buffer.alloc(0)).length}/24 bytes)`;
+  }
+  return `${rightPadRaw(b.length, 4)} bytes  ${hexDump(b)}`;
+}
+
+function cycleSniffViewMode() {
+  const i = SNIFF_VIEW_MODES.indexOf(state.sniff.viewMode || 'smart');
+  state.sniff.viewMode = SNIFF_VIEW_MODES[(i + 1 + SNIFF_VIEW_MODES.length) % SNIFF_VIEW_MODES.length];
+  state.sniff.partial = Buffer.alloc(0);
+  state.status = `Sniffer view mode: ${state.sniff.viewMode}`;
+  render();
 }
 
 
@@ -191,7 +282,7 @@ function sniffReadLoop() {
       const chunk = buf.subarray(0, bytesRead);
       state.sniff.bytes += bytesRead;
       state.sniff.reads += 1;
-      sniffAddLine(`${rightPadRaw(bytesRead, 4)} bytes  ${hexDump(chunk)}`);
+      sniffAddLine(formatSniffChunk(chunk));
     }
     setTimeout(sniffReadLoop, bytesRead > 0 ? 0 : 25);
   });
@@ -228,6 +319,7 @@ function toggleSniffer() {
   state.sniff.lines = [];
   state.sniff.bytes = 0;
   state.sniff.reads = 0;
+  state.sniff.partial = Buffer.alloc(0);
   render();
   const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
   fs.open(target.path, flags, (err, fd) => {
@@ -1727,7 +1819,7 @@ function sniffTargetStatusText(t) {
 }
 
 function sniffTargetHelpLine() {
-  return `${bold('Sniff targets')}  ${dim('[ / ] choose target   o open/close selected target')}`;
+  return `${bold('Sniff targets')}  ${dim('[ / ] choose target   o open/close selected target   m view mode')}`;
 }
 
 function detailLines(d) {
@@ -1855,7 +1947,7 @@ function detailLines(d) {
     lines.push(`  State: ${state.sniff.opening ? 'opening' : state.sniff.active ? 'open/read loop active' : 'closed'}`);
     if (state.sniff.path) lines.push(`  Node: ${state.sniff.path}`);
     if (state.sniff.kind) lines.push(`  Kind: ${state.sniff.kind}`);
-    lines.push(`  Reads: ${state.sniff.reads || 0}   Bytes: ${state.sniff.bytes || 0}`);
+    lines.push(`  Reads: ${state.sniff.reads || 0}   Bytes: ${state.sniff.bytes || 0}   View: ${state.sniff.viewMode || 'smart'}`);
     if (state.sniff.error) lines.push(`  Last error: ${state.sniff.error}`);
     lines.push('');
     lines.push(bold('Received bytes'));
@@ -2003,7 +2095,7 @@ function titleHelpLine() {
   const title = cyan(APP_TITLE);
   if (!state.showKeys) return `${title} —  press k for keyboard mappings`;
 
-  return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  o open/close sniffer  [/] target  r/R refresh  k hide keys  q quit`;
+  return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  o open/close sniffer  [/] target  m sniff view  r/R refresh  k hide keys  q quit`;
 }
 
 function render() {
@@ -2130,6 +2222,7 @@ function handleInput(buf) {
   if (s === 'o' || s === 'O') { if (state.tab !== 5) state.tab = 5; toggleSniffer(); return; }
   if (s === '[') { if (state.tab !== 5) state.tab = 5; cycleSniffTarget(-1); return; }
   if (s === ']') { if (state.tab !== 5) state.tab = 5; cycleSniffTarget(1); return; }
+  if (s === 'm' || s === 'M') { if (state.tab !== 5) state.tab = 5; cycleSniffViewMode(); return; }
   if (s === 'j' || s === '\x1b[B') { selectDelta(1); return; }
   if (s === '\x1b[A') { selectDelta(-1); return; }
   if (s === '\x1b[C') { setTab(state.tab + 1); return; }
