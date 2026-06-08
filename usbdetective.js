@@ -1416,7 +1416,7 @@ function ensureSelectedVisualVisible(visualRows, height) {
 
 
 function topHelpLine() {
-  if (!state.showKeys) return 'USB Detective v20260608.1-kernel-harvest —  press k for keyboard mappings';
+  if (!state.showKeys) return 'USB Detective v20260608.1 —  press k for keyboard mappings';
 
   return 'Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit';
 }
@@ -1427,7 +1427,7 @@ function render() {
   if (!state.lastPollAt && !state.devices.length) {
     const { cols, rows } = termSize();
     let out = '\x1b[?25l\x1b[H';
-    out += pad(cyan('USB Detective v20260608.1-kernel-harvest'), cols) + '\n';
+    out += pad(cyan('USB Detective v20260608.1 '), cols) + '\n';
     out += '─'.repeat(cols) + '\n';
     out += '\n';
     out += pad(state.startupMessage, cols) + '\n';
@@ -1452,7 +1452,7 @@ function render() {
   state.leftRowMap.clear();
 
   let out = '\x1b[?25l\x1b[H';
-  out += pad(cyan('USB Detective v20260608.1-kernel-harvest'), cols) + '\n';
+  out += pad(cyan('USB Detective v20260608.1 '), cols) + '\n';
   out += pad(topHelpLine(), cols) + '\n';
   out += '─'.repeat(cols) + '\n';
 
