@@ -30,10 +30,13 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.12';
+const APP_VERSION = 'v20260608.13';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
-const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
+// Heavy handle detection can walk /proc and run lsof/fuser.
+// Default is now manual-refresh mode: one startup scan, then no background USB rescans.
+// Set USB_DETECTIVE_POLL_MS=1000 or similar if you want old live polling back.
+const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 0);
 const KEEP_REMOVED_MS = Number(process.env.USB_DETECTIVE_KEEP_REMOVED_MS || 4500);
 const HIGHLIGHT_MS = Number(process.env.USB_DETECTIVE_HIGHLIGHT_MS || 5000);
 const USE_COLOR = process.env.USB_DETECTIVE_COLOR !== '0' && process.stdout.isTTY;
@@ -986,7 +989,8 @@ async function poll(force = false) {
         state.selectedRowKey = state.selectedKey;
       }
     }
-    state.status = `Updated ${snap.when.toLocaleTimeString()}  |  ${snap.devices.length} active USB devices`;
+    const mode = POLL_MS > 0 ? `polling every ${POLL_MS}ms` : 'manual refresh mode';
+    state.status = `Updated ${snap.when.toLocaleTimeString()}  |  ${snap.devices.length} active USB devices  |  ${mode}`;
     const sig = signature(snap);
     if (force || sig !== state.lastSignature) { state.lastSignature = sig; render(); }
   } catch (e) {
@@ -1999,7 +2003,7 @@ function titleHelpLine() {
   const title = cyan(APP_TITLE);
   if (!state.showKeys) return `${title} —  press k for keyboard mappings`;
 
-  return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  o open/close sniffer  [/] target  r refresh  k hide keys  q quit`;
+  return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  o open/close sniffer  [/] target  r/R refresh  k hide keys  q quit`;
 }
 
 function render() {
@@ -2121,7 +2125,7 @@ function handleInput(buf) {
   if (/\x1b\[<\d+;\d+;\d+[mM]/.test(s)) return;
 
   if (s === '\u0003' || s === 'q') { cleanup(); process.exit(0); }
-  if (s === 'r') { poll(true); return; }
+  if (s === 'r' || s === 'R') { poll(true); return; }
   if (s === 'k' || s === 'K') { state.showKeys = !state.showKeys; render(); return; }
   if (s === 'o' || s === 'O') { if (state.tab !== 5) state.tab = 5; toggleSniffer(); return; }
   if (s === '[') { if (state.tab !== 5) state.tab = 5; cycleSniffTarget(-1); return; }
@@ -2156,9 +2160,20 @@ async function main() {
   enterTuiScreen();
   render();
   await poll(true);
-  setInterval(() => poll(false), POLL_MS);
-  setInterval(() => {
-    if (pruneHighlights()) render();
+
+  // No background topology/handle polling unless explicitly enabled.
+  // The expensive part is collectSnapshot(): lsusb, udevadm, lsblk, dmesg,
+  // v4l2-ctl, lsof/fuser, and /proc fd walks for each discovered /dev node.
+  // Press r/R for an explicit rescan, or set USB_DETECTIVE_POLL_MS to restore polling.
+  if (POLL_MS > 0) setInterval(() => poll(false), POLL_MS);
+
+  // Cheap UI-only timer for expiring green/red hotplug highlights. Disabled
+  // after the highlight windows are gone, so idle means idle.
+  const highlightTimer = setInterval(() => {
+    if (state.addedUntil.size || state.removedUntil.size) {
+      if (pruneHighlights()) render();
+    }
   }, 250);
+  highlightTimer.unref && highlightTimer.unref();
 }
 main().catch(e => { cleanup(); console.error(e); process.exit(1); });
