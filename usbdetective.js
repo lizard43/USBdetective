@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.4';
+const APP_VERSION = 'v20260608.5';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
@@ -1193,6 +1193,90 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
   });
 }
 
+function collectTopoKeys(roots) {
+  const keys = new Set();
+  function walk(n) {
+    if (!n) return;
+    if (n.key) keys.add(n.key);
+    for (const c of n.children || []) walk(c);
+  }
+  for (const r of roots || []) walk(r);
+  return keys;
+}
+
+function newsReasonForDevice(d, topoKeys) {
+  if (isRemovedDevice(d)) return 'Unplugged / recently removed';
+  if (isAddedKey(d.key) && !topoKeys.has(d.key)) return 'New / topology pending';
+  if (isAddedKey(d.key)) return 'Newly detected';
+  if (!topoKeys.has(d.key) && !d.removed) return 'Not placed in topology yet';
+  return '';
+}
+
+function addNewsDeviceRows(rows, d, reason, isLast) {
+  const branch = isLast ? '└─' : '├─';
+  const childPrefix = isLast ? '   ' : '│  ';
+  rows.push({
+    type:'dev',
+    key:d.key,
+    selectKey:d.key,
+    device:d,
+    text:`${branch} ${reason}: ${d.name || '(unnamed USB device)'}`,
+    selectable:true
+  });
+
+  const nodes = (d.devNodes || []).map(n => n.path).sort();
+  const metaPrefix = childPrefix + (nodes.length ? '│  ' : '   ');
+  const lines = [
+    `Bus ${d.bus}  Dev ${d.dev}  ID ${d.vid}:${d.pid}${d.devNodes && d.devNodes.length ? `  Handles ${d.devNodes.length}` : ''}`
+  ];
+  if (d.kernel && d.kernel.roles && d.kernel.roles.length) lines.push(`Functions ${d.kernel.roles.join('/')}`);
+  if (d.removed) lines.push('Device is no longer active; retained briefly for visibility.');
+
+  lines.forEach((line, idx) => rows.push({
+    type:'meta',
+    key:`news:${d.key}:meta${idx || ''}`,
+    selectKey:d.key,
+    parentKey:d.key,
+    device:d,
+    text:`${metaPrefix}${line}`,
+    selectable:false
+  }));
+
+  nodes.forEach((n, j) => rows.push({
+    type:'node',
+    key:`news:${d.key}:${n}`,
+    selectKey:d.key,
+    parentKey:d.key,
+    device:d,
+    text:`${childPrefix}${j === nodes.length - 1 ? '└─' : '├─'} ${leftDevNodeLabel(d, n)}`,
+    selectable:false
+  }));
+}
+
+function addTopNewsRows(rows, topoKeys) {
+  const news = [];
+  const seen = new Set();
+
+  for (const d of state.devices) {
+    const reason = newsReasonForDevice(d, topoKeys);
+    if (!reason || seen.has(d.key)) continue;
+    seen.add(d.key);
+    news.push({ d, reason });
+  }
+
+  news.sort((a, b) => {
+    const rank = r => /Unplugged/.test(r) ? 0 : /New/.test(r) ? 1 : 2;
+    return rank(a.reason) - rank(b.reason) ||
+      String(a.d.bus).localeCompare(String(b.d.bus)) ||
+      Number(a.d.dev) - Number(b.d.dev);
+  });
+
+  if (!news.length) return;
+
+  rows.push({ type:'bus', key:'news:top', text:'USB changes / topology pending', selectable:false });
+  news.forEach((item, i) => addNewsDeviceRows(rows, item.d, item.reason, i === news.length - 1));
+}
+
 function buildRows() {
   const roots = parseLsusbTopology(state.tree);
   if (!roots.length) return buildFallbackRows();
@@ -1201,6 +1285,9 @@ function buildRows() {
   for (const r of roots) enrichTopoNode(r, deviceMap);
 
   const rows = [];
+  const topoKeys = collectTopoKeys(roots);
+  addTopNewsRows(rows, topoKeys);
+
   const byBus = new Map();
   for (const r of roots) {
     if (!byBus.has(r.bus)) byBus.set(r.bus, []);
@@ -1211,25 +1298,6 @@ function buildRows() {
     rows.push({ type:'bus', key:`bus:${bus}`, text:`USB Bus ${bus}`, selectable:false });
     const busRoots = byBus.get(bus).sort((a,b) => Number(a.dev) - Number(b.dev));
     busRoots.forEach((r, i) => addTopoNodeRows(rows, r, '', i === busRoots.length - 1));
-  }
-
-  // Some devices can appear in lsusb but not in lsusb -t during hotplug churn.
-  // Keep them visible instead of silently losing them.
-  const seen = new Set(rows.filter(r => r.type === 'dev').map(r => r.key));
-  const missing = state.devices.filter(d => !seen.has(d.key));
-  if (missing.length) {
-    rows.push({ type:'bus', key:'bus:unmapped', text:'USB devices not placed in topology yet', selectable:false });
-    missing.forEach((d, i) => {
-      const isLast = i === missing.length - 1;
-      rows.push({
-        type:'dev',
-        key:d.key,
-        selectKey:d.key,
-        device:d,
-        text:`${isLast ? '└─' : '├─'} ${d.name || '(unnamed USB device)'}`,
-        selectable:true
-      });
-    });
   }
 
   return rows;
