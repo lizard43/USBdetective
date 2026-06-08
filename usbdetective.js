@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.2';
+const APP_VERSION = 'v20260608.3';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
@@ -132,7 +132,7 @@ async function getDmesgTail() {
   return (r.stdout || '').split('\n').filter(l => /usb|ttyUSB|ttyACM|cdc_acm|ch341|ch34|ftdi|cp210|pl2303|hid|input|video|uvc|storage|scsi|sd[a-z]|disconnect/i.test(l)).slice(-60);
 }
 async function getDevCandidates() {
-  const cmd = `for p in /dev/ttyUSB* /dev/ttyACM* /dev/video* /dev/hidraw* /dev/sd* /dev/nvme* /dev/input/event*; do [ -e "$p" ] && echo "$p"; done | sort -V`;
+  const cmd = `for p in /dev/ttyUSB* /dev/ttyACM* /dev/video* /dev/hidraw* /dev/sd* /dev/nvme* /dev/input/event* /dev/input/mouse* /dev/input/mice; do [ -e "$p" ] && echo "$p"; done | sort -V`;
   const r = await sh(cmd, { timeout: 3000, maxBuffer: 1024 * 1024 });
   return (r.stdout || '').split('\n').map(s => s.trim()).filter(Boolean);
 }
@@ -214,10 +214,63 @@ async function procInfo(pid) {
   };
 }
 
+
+function linuxMajor(dev) {
+  dev = Number(dev || 0);
+  return ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfff);
+}
+
+function linuxMinor(dev) {
+  dev = Number(dev || 0);
+  return (dev & 0xff) | ((dev >> 12) & ~0xff);
+}
+
+async function devNodeIdentity(devPath) {
+  try {
+    const st = await fs.promises.stat(devPath);
+    return {
+      path: devPath,
+      dev: st.dev,
+      ino: st.ino,
+      rdev: st.rdev,
+      major: linuxMajor(st.rdev),
+      minor: linuxMinor(st.rdev),
+      mode: st.mode
+    };
+  } catch {
+    return null;
+  }
+}
+
+function looksLikeInputConsumer(info) {
+  const text = `${info.command || ''} ${info.cmdline || ''}`.toLowerCase();
+  return /\b(systemd-logind|xorg|xwayland|wayland|mutter|gnome-shell|cinnamon|kwin|plasmashell|xfce4|mate-settings-daemon|libinput|xinput|evtest|input-remapper|solaar|ratbagd|piper)\b/.test(text);
+}
+
+async function scanLikelyInputConsumers() {
+  const out = [];
+  let pids = [];
+  try {
+    pids = (await fs.promises.readdir('/proc')).filter(x => /^\d+$/.test(x));
+  } catch {
+    return out;
+  }
+
+  for (const pid of pids) {
+    try {
+      const info = await procInfo(pid);
+      if (looksLikeInputConsumer(info)) out.push({ ...info, fds: [], source: 'input-stack guess' });
+    } catch {}
+  }
+
+  return out.sort((a, b) => Number(a.pid) - Number(b.pid));
+}
+
 async function scanProcOpeners(devPath) {
   const out = [];
   let devReal = devPath;
   try { devReal = await fs.promises.realpath(devPath); } catch {}
+  const targetIdentity = await devNodeIdentity(devPath);
   let pids = [];
   try {
     pids = (await fs.promises.readdir('/proc')).filter(x => /^\d+$/.test(x));
@@ -232,15 +285,27 @@ async function scanProcOpeners(devPath) {
 
     const matchedFds = [];
     for (const fd of fds) {
+      const fdPath = `${fdDir}/${fd}`;
       try {
-        const link = await fs.promises.readlink(`${fdDir}/${fd}`);
+        const link = await fs.promises.readlink(fdPath);
         let resolved = link;
         if (link.startsWith('/dev/')) {
           try { resolved = await fs.promises.realpath(link); } catch {}
         }
+
+        let reason = '';
         if (link === devPath || link === devReal || resolved === devReal) {
-          matchedFds.push({ fd, target: link });
+          reason = 'path';
+        } else if (targetIdentity && Number(targetIdentity.rdev || 0) > 0) {
+          try {
+            const fst = await fs.promises.stat(fdPath);
+            if (Number(fst.rdev || 0) === Number(targetIdentity.rdev || 0)) {
+              reason = `major/minor ${targetIdentity.major}:${targetIdentity.minor}`;
+            }
+          } catch {}
         }
+
+        if (reason) matchedFds.push({ fd, target: link, match: reason });
       } catch {}
     }
 
@@ -310,10 +375,12 @@ async function fuserOpeners(devPath) {
 }
 
 async function getHandleUsers(devPath) {
-  const [lsof, procfs, fuser] = await Promise.all([
+  const isInputNode = /^\/dev\/input\//.test(devPath);
+  const [lsof, procfs, fuser, likelyInputConsumers] = await Promise.all([
     lsofOpeners(devPath).catch(() => []),
     scanProcOpeners(devPath).catch(() => []),
-    fuserOpeners(devPath).catch(() => ({ ok:false, stdout:'', stderr:'', available:false }))
+    fuserOpeners(devPath).catch(() => ({ ok:false, stdout:'', stderr:'', available:false })),
+    isInputNode ? scanLikelyInputConsumers().catch(() => []) : Promise.resolve([])
   ]);
 
   const byPid = new Map();
@@ -334,7 +401,7 @@ async function getHandleUsers(devPath) {
   const processes = [...byPid.values()].map(p => {
     const seen = new Set();
     p.fds = (p.fds || []).filter(fd => {
-      const k = `${fd.fd}|${fd.target || ''}`;
+      const k = `${fd.fd}|${fd.target || ''}|${fd.match || ''}`;
       if (seen.has(k)) return false;
       seen.add(k);
       return true;
@@ -342,8 +409,14 @@ async function getHandleUsers(devPath) {
     return p;
   }).sort((a, b) => Number(a.pid) - Number(b.pid));
 
-  return { processes, fuser };
+  const openPids = new Set(processes.map(p => String(p.pid)));
+  const likelyConsumers = (likelyInputConsumers || [])
+    .filter(p => p && p.pid && !openPids.has(String(p.pid)))
+    .slice(0, 12);
+
+  return { processes, likelyConsumers, fuser };
 }
+
 async function getLsblkJson() {
   const r = await run('lsblk', ['-J','-o','NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,MODEL,SERIAL,TRAN,RM,MOUNTPOINTS'], { timeout: 3000, maxBuffer: 2 * 1024 * 1024 });
   try { return JSON.parse(r.stdout || '{}'); } catch { return {}; }
@@ -370,6 +443,7 @@ function classifyDevNode(devPath, props) {
   if (/^ttyACM\d+$/.test(base)) return 'CDC/ACM serial device';
   if (/^video\d+$/.test(base)) return 'Video/camera node';
   if (/^hidraw\d+$/.test(base)) return 'HID raw node';
+  if (/^mouse\d+$/.test(base) || base === 'mice') return 'Input mouse aggregate node';
   if (/^event\d+$/.test(base)) {
     const kind = inputKindFromProps(props);
     return kind ? `Input event node — ${kind}` : 'Input event node';
@@ -430,7 +504,7 @@ function inferInputKindFromSysfs(info) {
 
 async function inputSysfsInfo(devPath, props) {
   const base = path.basename(devPath);
-  if (!/^event\d+$/.test(base)) return null;
+  if (!/^(event|mouse)\d+$/.test(base) && base !== 'mice') return null;
 
   const candidates = [
     `/sys/class/input/${base}/device`,
@@ -490,6 +564,7 @@ async function videoNodeInfo(devPath, props) {
 }
 
 async function decorateDevNode(record) {
+  record.devIdentity = await devNodeIdentity(record.path).catch(() => null);
   record.input = await inputSysfsInfo(record.path, record.props).catch(() => null);
   record.video = await videoNodeInfo(record.path, record.props).catch(() => null);
   return record;
@@ -1182,6 +1257,7 @@ function handleDetailLines(d) {
     lines.push(`  Type: ${friendlyDevNodeType(n)}`);
     if (n.iface) lines.push(`  Interface: ${n.iface}`);
     if (n.stat) lines.push(`  Node: ${n.stat}`);
+    if (n.devIdentity && Number(n.devIdentity.rdev || 0) > 0) lines.push(`  Device ID: major/minor ${n.devIdentity.major}:${n.devIdentity.minor}`);
     if (n.input && n.input.name) lines.push(`  Input name: ${n.input.name}`);
     if (n.video) {
       const vb = [n.video.card || n.video.name, n.video.driver].filter(Boolean).join(' / ');
@@ -1199,6 +1275,15 @@ function handleDetailLines(d) {
     const procs = users.processes || [];
     if (!procs.length) {
       lines.push('  Process holders: none detected');
+      const likely = users.likelyConsumers || [];
+      if (likely.length) {
+        lines.push('  Likely desktop/input stack consumers:');
+        lines.push('    PID       USER        COMMAND');
+        for (const p of likely) {
+          lines.push(`    ${rightPadRaw(p.pid, 9)} ${rightPadRaw(p.user || '?', 11)} ${shortCmd(p) || '?'}`);
+        }
+        lines.push('    Note: these processes may receive input through libinput/logind without holding this exact event node open.');
+      }
       if (users.fuser && users.fuser.stderr && /Permission denied/i.test(users.fuser.stderr)) {
         lines.push('  Note: process detection may need sudo for full visibility.');
       }
@@ -1215,9 +1300,14 @@ function handleDetailLines(d) {
     for (const p of procs) {
       const user = p.user || '?';
       const cmd = shortCmd(p) || '?';
-      const fds = (p.fds || []).map(fd => `${fd.fd}${fd.type ? '/' + fd.type : ''}`).join(', ') || '?';
+      const fds = (p.fds || []).map(fd => `${fd.fd}${fd.type ? '/' + fd.type : ''}${fd.match ? '[' + fd.match + ']' : ''}`).join(', ') || '?';
       lines.push(`    ${rightPadRaw(p.pid, 9)} ${rightPadRaw(user, 11)} ${rightPadRaw(fds, 21)} ${cmd}`);
       if (p.source) lines.push(`              Found by: ${p.source}`);
+    }
+    const likely = users.likelyConsumers || [];
+    if (likely.length) {
+      lines.push('  Other likely desktop/input stack consumers:');
+      for (const p of likely) lines.push(`    ${rightPadRaw(p.pid, 9)} ${rightPadRaw(p.user || '?', 11)} ${shortCmd(p) || '?'}`);
     }
     lines.push('');
   });
