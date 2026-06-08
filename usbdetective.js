@@ -3,6 +3,8 @@
   usbdetective.js - USB topology TUI for Linux Mint
 
   No npm dependencies. Uses lsusb, udevadm, lsblk, dmesg, and optional v4l2-ctl.
+  Default behavior is manual snapshot mode: scan once, then press r to rescan.
+  Set USB_DETECTIVE_WATCH=1 to enable background monitoring.
 
   Keys:
     Up/Down            Select USB devices/hubs in the topology tree
@@ -10,7 +12,8 @@
     Left/Right         Previous/next detail tab
     1..6               Select detail tab
     k or K             Toggle keyboard mapping help
-    r                  Refresh now
+    r                  Refresh/rescan now
+    R                  Deep scan process holders for selected device
     q or Ctrl-C        Quit
 
   Mouse:
@@ -20,7 +23,8 @@
     Real USB topology from lsusb -t, enriched with lsusb names and /dev handles.
 
   Env:
-    USB_DETECTIVE_POLL_MS=1000
+    USB_DETECTIVE_WATCH=0       optional background monitor; default is manual refresh only
+    USB_DETECTIVE_POLL_MS=3000  used only when USB_DETECTIVE_WATCH=1
     USB_DETECTIVE_COLOR=0
     USB_DETECTIVE_KEEP_REMOVED_MS=4500
     USB_DETECTIVE_HIGHLIGHT_MS=5000
@@ -30,10 +34,12 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.6';
+const APP_VERSION = 'v20260608.7';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
-const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
+const WATCH_MODE = process.env.USB_DETECTIVE_WATCH === '1';
+const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 3000);
+const DEEP_DEVINFO = process.env.USB_DETECTIVE_DEEP_DEVINFO === '1';
 const KEEP_REMOVED_MS = Number(process.env.USB_DETECTIVE_KEEP_REMOVED_MS || 4500);
 const HIGHLIGHT_MS = Number(process.env.USB_DETECTIVE_HIGHLIGHT_MS || 5000);
 const USE_COLOR = process.env.USB_DETECTIVE_COLOR !== '0' && process.stdout.isTTY;
@@ -104,11 +110,12 @@ function run(cmd, args = [], opts = {}) {
 async function sh(command, opts = {}) { return run('bash', ['-lc', command], opts); }
 
 let state = {
-  startupMessage: 'Scanning USB buses, hubs, drivers, handles and udev data... please wait',
+  startupMessage: 'Scanning USB buses, topology and udev data... please wait',
   showKeys: false,
   devices: [], rows: [], selectedKey: null, selectedRowKey: null, selectedIndex: 0, detailScroll: 0, leftScroll: 0, tab: 0,
   previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
+  scanCount: 0, lastScanMs: 0, deepScanning: false,
   leftRowMap: new Map(), lastPollAt: null
 };
 const tabs = ['Summary', '/dev', 'Handles', 'Driver', 'Kernel', 'Raw USB'];
@@ -543,7 +550,7 @@ async function videoNodeInfo(devPath, props) {
     if (v) { info.name = v; break; }
   }
 
-  const r = await run('v4l2-ctl', ['--device', devPath, '--info'], { timeout: 1800, maxBuffer: 256 * 1024 }).catch(() => ({ ok:false, stdout:'' }));
+  const r = DEEP_DEVINFO ? await run('v4l2-ctl', ['--device', devPath, '--info'], { timeout: 1000, maxBuffer: 256 * 1024 }).catch(() => ({ ok:false, stdout:'' })) : { ok:false, stdout:'' };
   if (r && r.ok && r.stdout) {
     for (const line of r.stdout.split('\n')) {
       let m = line.match(/^\s*Driver name\s*:\s*(.*)$/); if (m) info.driver = m[1].trim();
@@ -557,7 +564,7 @@ async function videoNodeInfo(devPath, props) {
     }
   }
 
-  const fr = await run('v4l2-ctl', ['--device', devPath, '--list-formats-ext'], { timeout: 2200, maxBuffer: 512 * 1024 }).catch(() => ({ ok:false, stdout:'' }));
+  const fr = DEEP_DEVINFO ? await run('v4l2-ctl', ['--device', devPath, '--list-formats-ext'], { timeout: 1200, maxBuffer: 512 * 1024 }).catch(() => ({ ok:false, stdout:'' })) : { ok:false, stdout:'' };
   if (fr && fr.ok && fr.stdout) {
     for (const line of fr.stdout.split('\n')) {
       const m = line.match(/\[\d+\]:\s+'([^']+)'\s+\((.+)\)/);
@@ -713,7 +720,7 @@ async function enrichDevice(dev, allNodes, blockMap, kernelClues) {
     const bd = busDevFromProps(props);
     const vp = vidPidFromProps(props);
     if (bd === dev.key || (!bd && vp === `${dev.vid}:${dev.pid}`) || (vp === `${dev.vid}:${dev.pid}` && path.basename(node).match(/^(ttyUSB|ttyACM|video|hidraw|event|sd|nvme)/))) {
-      matches.push(await decorateDevNode({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node), usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null }));
+      matches.push(await decorateDevNode({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: null, usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null }));
     }
   }
   // Fallback: some tty nodes do not expose BUSNUM/DEVNUM, but do expose matching VID/PID.
@@ -721,7 +728,7 @@ async function enrichDevice(dev, allNodes, blockMap, kernelClues) {
     for (const node of allNodes) {
       const props = await udevProps(node);
       if (vidPidFromProps(props) === `${dev.vid}:${dev.pid}`) {
-        matches.push(await decorateDevNode({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node), usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null }));
+        matches.push(await decorateDevNode({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: null, usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null }));
       }
     }
   }
@@ -828,7 +835,10 @@ async function poll(force = false) {
   if (state.polling) return;
   state.polling = true;
   try {
+    const t0 = Date.now();
     const snap = await collectSnapshot();
+    state.lastScanMs = Date.now() - t0;
+    state.scanCount += 1;
     updateHighlights(snap.devices);
     state.devices = mergedDevices(snap.devices);
     state.tree = snap.tree;
@@ -846,7 +856,7 @@ async function poll(force = false) {
         state.selectedRowKey = state.selectedKey;
       }
     }
-    state.status = `Updated ${snap.when.toLocaleTimeString()}  |  ${snap.devices.length} active USB devices`;
+    state.status = `Scanned ${snap.when.toLocaleTimeString()}  |  ${snap.devices.length} active USB devices  |  ${state.lastScanMs} ms  |  ${WATCH_MODE ? 'watch on' : 'manual refresh: r / deep handles: R'}`;
     const sig = signature(snap);
     if (force || sig !== state.lastSignature) { state.lastSignature = sig; render(); }
   } catch (e) {
@@ -1373,8 +1383,8 @@ function handleDetailLines(d) {
   const activeNodes = d.devNodes || [];
 
   lines.push(bold('Handles / open processes'), '');
-  lines.push('For each /dev node created by the selected USB device, this tab shows node metadata and any user-space processes that currently have that node open.');
-  lines.push('Use PgUp/PgDn to scroll this pane when a device has many handles.');
+  lines.push('For each /dev node created by the selected USB device, this tab shows node metadata. Process-holder scanning is intentionally on-demand because scanning /proc/lsof/fuser for every node on every refresh is expensive.');
+  lines.push('Press R on this tab to scan process holders for the selected device. Use PgUp/PgDn to scroll.');
   lines.push('');
 
   if (!activeNodes.length) {
@@ -1406,6 +1416,13 @@ function handleDetailLines(d) {
       n.links[0];
 
     if (best) lines.push(`  Stable name: ${best.split(' -> ')[0]}`);
+
+    if (!n.users) {
+      lines.push('  Process holders: not scanned');
+      lines.push('  Press R to run the slower process-holder scan for this selected device.');
+      lines.push('');
+      return;
+    }
 
     const users = n.users || {};
     const procs = users.processes || [];
@@ -1645,6 +1662,14 @@ function suggestions(d) {
     lines.push('  For stable matching, prefer ID_PATH/DEVPATH over event numbers because /dev/input/eventN can change after replug.');
   } else if (/root hub/i.test(d.name)) {
     lines.push(`  Root hub: logical top of USB Bus ${d.bus}. Downstream hubs/devices are shown under it in the left topology tree.`);
+  } else if (/st-link|stmicro/i.test(d.name || '') || /0483:3748/i.test(`${d.vid}:${d.pid}`)) {
+    lines.push('  ST-LINK/V2 note: this unit is present on USB but currently exposes no Linux /dev node.');
+    lines.push('  That is normal for a vendor-specific debug probe when no ttyACM/ttyUSB, hidraw, input, storage, or video interface is created.');
+    lines.push('  Check the Driver and Kernel tabs. If you expected a serial port, confirm firmware/interface mode and kernel driver binding.');
+  } else if (d.devNodes && !d.devNodes.length) {
+    lines.push('  USB device is present, but no matching /dev node was found.');
+    lines.push('  Many vendor-specific devices are controlled by a kernel driver or libusb directly and never create tty/video/input/storage nodes.');
+    lines.push('  Check Driver/Kernel tabs and try: lsusb -t ; lsusb -v -s BUS:DEV');
   } else {
     lines.push('  Check Driver tab for udev details. The left pane shows hub/port placement.');
   }
@@ -1764,9 +1789,9 @@ function ensureSelectedVisualVisible(visualRows, height) {
 
 function titleHelpLine() {
   const title = titleGreen(APP_TITLE);
-  if (!state.showKeys) return `${title} —  press k for keyboard mappings`;
+  if (!state.showKeys) return `${title} —  press k for keyboard mappings   r rescan   R deep handles`;
 
-  return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit`;
+  return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r rescan  R scan handles  k hide keys  q quit`;
 }
 
 function render() {
@@ -1781,9 +1806,9 @@ function render() {
     out += pad(state.startupMessage, cols) + '\n';
     out += '\n';
     out += pad('Gathering USB topology from lsusb -t...', cols) + '\n';
-    out += pad('Enumerating /dev handles...', cols) + '\n';
+    out += pad('Enumerating /dev nodes...', cols) + '\n';
     out += pad('Querying udev properties...', cols) + '\n';
-    out += pad('Scanning process handles...', cols) + '\n';
+    out += pad('Process holders are scanned only on demand with R.', cols) + '\n';
     out += '\x1b[J';
     process.stdout.write(out);
     return;
@@ -1872,6 +1897,26 @@ function cleanup() {
   leaveTuiScreen();
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
 }
+
+async function scanSelectedHandles() {
+  const d = selectedDevice();
+  if (!d || !(d.devNodes || []).length || state.deepScanning) return;
+  state.deepScanning = true;
+  const oldStatus = state.status;
+  state.status = `Scanning process holders for ${d.name || d.key}...`;
+  render();
+  const t0 = Date.now();
+  try {
+    for (const n of d.devNodes || []) {
+      n.users = await getHandleUsers(n.path).catch(() => ({ processes: [], likelyConsumers: [], fuser: { ok:false, stdout:'', stderr:'', available:false } }));
+    }
+    state.status = `Handle scan complete for ${d.name || d.key}  |  ${Date.now() - t0} ms`;
+  } finally {
+    state.deepScanning = false;
+    render();
+  }
+}
+
 function handleInput(buf) {
   const s = buf.toString('utf8');
 
@@ -1884,6 +1929,7 @@ function handleInput(buf) {
 
   if (s === '\u0003' || s === 'q') { cleanup(); process.exit(0); }
   if (s === 'r') { poll(true); return; }
+  if (s === 'R') { scanSelectedHandles(); return; }
   if (s === 'k' || s === 'K') { state.showKeys = !state.showKeys; render(); return; }
   if (s === 'j' || s === '\x1b[B') { selectDelta(1); return; }
   if (s === '\x1b[A') { selectDelta(-1); return; }
@@ -1914,7 +1960,7 @@ async function main() {
   enterTuiScreen();
   render();
   await poll(true);
-  setInterval(() => poll(false), POLL_MS);
+  if (WATCH_MODE) setInterval(() => poll(false), POLL_MS);
   setInterval(() => {
     if (pruneHighlights()) render();
   }, 250);
