@@ -367,7 +367,10 @@ function classifyDevNode(devPath, props) {
   if (/^ttyACM\d+$/.test(base)) return 'CDC/ACM serial device';
   if (/^video\d+$/.test(base)) return 'Video/camera node';
   if (/^hidraw\d+$/.test(base)) return 'HID raw node';
-  if (/^event\d+$/.test(base)) return 'Input event node';
+  if (/^event\d+$/.test(base)) {
+    const kind = inputKindFromProps(props);
+    return kind ? `Input event node — ${kind}` : 'Input event node';
+  }
   if (/^sd[a-z]\d*$/.test(base) || /^nvme\d+n\d+(p\d+)?$/.test(base)) return 'Storage/block node';
   if (props.ID_INPUT) return 'Input/HID node';
   return 'Device node';
@@ -381,14 +384,161 @@ function interfaceLabel(props) {
   const m = String(props.DEVPATH || '').match(/:(\d+)\.(\d+)(?:\/|$)/);
   return m ? `USB config ${m[1]} interface ${m[2]}` : '';
 }
-async function enrichDevice(dev, allNodes, blockMap) {
+function usbPathFromProps(props) {
+  const candidates = [props.DEVPATH || '', props.ID_PATH || ''];
+  for (const c of candidates) {
+    const matches = String(c).match(/\b\d+-\d+(?:\.\d+)*(?::\d+\.\d+)?\b/g) || [];
+    if (matches.length) {
+      return matches[matches.length - 1].replace(/:\d+\.\d+$/, '');
+    }
+  }
+  return '';
+}
+
+function inputKindFromProps(props) {
+  if (!props) return '';
+  const kinds = [];
+  if (props.ID_INPUT_MOUSE) kinds.push('Mouse');
+  if (props.ID_INPUT_KEYBOARD || props.ID_INPUT_KEY) kinds.push('Keyboard/key input');
+  if (props.ID_INPUT_TOUCHPAD) kinds.push('Touchpad');
+  if (props.ID_INPUT_JOYSTICK) kinds.push('Joystick/gamepad');
+  if (props.ID_INPUT_TABLET) kinds.push('Tablet');
+  if (props.ID_INPUT_TOUCHSCREEN) kinds.push('Touchscreen');
+  return kinds.join(' + ');
+}
+
+function devNodeKernelLabel(n) {
+  if (!n) return '';
+  const k = n.kernel || {};
+  const bits = [];
+  if (k.role) bits.push(k.role);
+  if (k.hidraw) bits.push(k.hidraw);
+  if (k.inputNumber && !String(n.path).endsWith(`event${k.inputNumber}`)) bits.push(`input${k.inputNumber}`);
+  const propKind = inputKindFromProps(n.props || {});
+  if (propKind && !bits.some(b => b.toLowerCase().includes(propKind.toLowerCase().split('/')[0]))) bits.push(propKind);
+  return bits.join(' / ');
+}
+
+function friendlyDevNodeType(n) {
+  const baseType = n.type || 'Device node';
+  const label = devNodeKernelLabel(n);
+  return label ? `${baseType} — ${label}` : baseType;
+}
+
+function parseKernelUsbClues(lines) {
+  const byUsbPath = new Map();
+  const byBusDev = new Map();
+  const byDevNode = new Map();
+  let lastUsbPath = '';
+
+  function ensureUsb(path) {
+    if (!path) return null;
+    if (!byUsbPath.has(path)) byUsbPath.set(path, { usbPath: path, lines: [], product: '', manufacturer: '', serial: '', vid: '', pid: '', bcdDevice: '', roles: [], hidraw: [], inputNodes: [] });
+    return byUsbPath.get(path);
+  }
+
+  function addLine(obj, line) {
+    if (!obj) return;
+    obj.lines.push(line);
+    if (obj.lines.length > 80) obj.lines.shift();
+  }
+
+  for (const line of lines || []) {
+    const body = String(line || '');
+    const usbLine = body.match(/\busb\s+(\d+-\d+(?:\.\d+)*):\s+(.*)$/i);
+    if (usbLine) {
+      const usbPath = usbLine[1];
+      const rest = usbLine[2];
+      lastUsbPath = usbPath;
+      const obj = ensureUsb(usbPath);
+      addLine(obj, body);
+
+      let m = rest.match(/New USB device found,\s*idVendor=([0-9a-fA-F]{4}),\s*idProduct=([0-9a-fA-F]{4}),\s*bcdDevice=\s*([^\s]+)/i);
+      if (m) { obj.vid = m[1].toLowerCase(); obj.pid = m[2].toLowerCase(); obj.bcdDevice = m[3]; }
+
+      m = rest.match(/new\s+(?:low|full|high|super)-speed USB device number\s+(\d+)\s+using\s+(\S+)/i);
+      if (m) {
+        const bus = usbPath.split('-')[0].padStart(3, '0');
+        const dev = String(m[1]).padStart(3, '0');
+        obj.bus = bus; obj.dev = dev; obj.hostDriver = m[2];
+        byBusDev.set(`${bus}:${dev}`, obj);
+      }
+
+      m = rest.match(/Product:\s*(.*)$/i); if (m) obj.product = m[1].trim();
+      m = rest.match(/Manufacturer:\s*(.*)$/i); if (m) obj.manufacturer = m[1].trim();
+      m = rest.match(/SerialNumber:\s*(.*)$/i); if (m) obj.serial = m[1].trim();
+      continue;
+    }
+
+    const inputLine = body.match(/\binput:\s+(.+?)(?:\s+(Keyboard|Mouse|Consumer Control|System Control|Joystick|Gamepad))?\s+as\s+(.+?\/input\/input(\d+))\b/i);
+    if (inputLine) {
+      const name = inputLine[1].trim();
+      const explicitRole = inputLine[2] || '';
+      const devpath = inputLine[3];
+      const inputNumber = inputLine[4];
+      const usbPathMatch = devpath.match(/\/usb\d+\/(?:[^/]+\/)*(\d+-\d+(?:\.\d+)*)(?::\d+\.\d+)?\//);
+      const usbPath = usbPathMatch ? usbPathMatch[1] : lastUsbPath;
+      const role = explicitRole || (/consumer/i.test(name) ? 'Consumer Control' : /system/i.test(name) ? 'System Control' : /mouse/i.test(name) ? 'Mouse' : /keyboard/i.test(name) ? 'Keyboard' : 'Input');
+      const obj = ensureUsb(usbPath);
+      const rec = { path: `/dev/input/event${inputNumber}`, inputNumber, name, role, source: 'kernel input', line: body };
+      if (obj) {
+        obj.inputNodes.push(rec);
+        obj.roles.push(role);
+        addLine(obj, body);
+      }
+      byDevNode.set(rec.path, rec);
+      continue;
+    }
+
+    const hidLine = body.match(/\bhid-generic\s+[^:]+:\s+(.+?)\s+USB HID v[^\[]+\[([^\]]+)\]\s+on\s+usb-[^/]+\/(.+)$/i);
+    if (hidLine) {
+      const nodeText = hidLine[1];
+      const role = (hidLine[2] || '').trim();
+      const tail = hidLine[3] || '';
+      const hp = nodeText.match(/\bhidraw\d+\b/i);
+      const usbPathMatch = tail.match(/(\d+-\d+(?:\.\d+)*)(?::\d+\.\d+)?(?:\/|$)/);
+      const usbPath = usbPathMatch ? usbPathMatch[1] : lastUsbPath;
+      const obj = ensureUsb(usbPath);
+      const rec = { path: hp ? `/dev/${hp[0]}` : '', hidraw: hp ? hp[0] : '', role, source: 'kernel hid-generic', line: body };
+      if (obj) {
+        if (rec.hidraw) obj.hidraw.push(rec);
+        obj.roles.push(role);
+        addLine(obj, body);
+      }
+      if (rec.path) byDevNode.set(rec.path, rec);
+      continue;
+    }
+  }
+
+  for (const obj of byUsbPath.values()) {
+    obj.roles = [...new Set((obj.roles || []).filter(Boolean))];
+    obj.inputNodes = uniqueBy(obj.inputNodes || [], x => x.path + '|' + x.role);
+    obj.hidraw = uniqueBy(obj.hidraw || [], x => x.path + '|' + x.role);
+  }
+
+  return { byUsbPath, byBusDev, byDevNode };
+}
+
+function uniqueBy(arr, fn) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr || []) {
+    const k = fn(x);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
+  }
+  return out;
+}
+
+async function enrichDevice(dev, allNodes, blockMap, kernelClues) {
   const matches = [];
   for (const node of allNodes) {
     const props = await udevProps(node);
     const bd = busDevFromProps(props);
     const vp = vidPidFromProps(props);
     if (bd === dev.key || (!bd && vp === `${dev.vid}:${dev.pid}`) || (vp === `${dev.vid}:${dev.pid}` && path.basename(node).match(/^(ttyUSB|ttyACM|video|hidraw|event|sd|nvme)/))) {
-      matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node) });
+      matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node), usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null });
     }
   }
   // Fallback: some tty nodes do not expose BUSNUM/DEVNUM, but do expose matching VID/PID.
@@ -396,11 +546,17 @@ async function enrichDevice(dev, allNodes, blockMap) {
     for (const node of allNodes) {
       const props = await udevProps(node);
       if (vidPidFromProps(props) === `${dev.vid}:${dev.pid}`) {
-        matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node) });
+        matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node), usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null });
       }
     }
   }
-  dev.devNodes = matches;
+  const usbPaths = [...new Set(matches.map(m => m.usbPath).filter(Boolean))];
+  let kdev = kernelClues && kernelClues.byBusDev ? kernelClues.byBusDev.get(dev.key) : null;
+  if (!kdev && kernelClues && kernelClues.byUsbPath) {
+    for (const p of usbPaths) { if (kernelClues.byUsbPath.has(p)) { kdev = kernelClues.byUsbPath.get(p); break; } }
+  }
+  dev.kernel = kdev || null;
+  dev.devNodes = matches.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
   for (const m of matches) {
     const b = blockMap.get(m.path);
     if (b) m.block = b;
@@ -409,8 +565,11 @@ async function enrichDevice(dev, allNodes, blockMap) {
 }
 async function collectSnapshot() {
   const [devices, tree, devNodes, lsblk, kernel] = await Promise.all([getLsusbDevices(), getLsusbTree(), getDevCandidates(), getLsblkJson(), getDmesgTail()]);
+  const kernelClues = parseKernelUsbClues(kernel);
   const blockMap = new Map(flattenBlock(lsblk).filter(d => d.path).map(d => [d.path, d]));
-  for (const d of devices) await enrichDevice(d, devNodes, blockMap);
+  for (const d of devices) {
+    await enrichDevice(d, devNodes, blockMap, kernelClues);
+  }
   return { devices, tree, kernel, when: new Date() };
 }
 function pruneHighlights(now = Date.now()) {
@@ -568,8 +727,18 @@ function deviceInfoLines(t, d) {
   if (classes.length) softwareBits.push(`Class ${classes.join('/')}`);
   const handles = devHandleSummary(d);
   if (handles) softwareBits.push(handles);
+  if (d.kernel && d.kernel.roles && d.kernel.roles.length) softwareBits.push(`HID ${d.kernel.roles.join('/')}`);
 
   return [identityBits.join('  '), softwareBits.join('  ')];
+}
+
+
+function leftDevNodeLabel(d, devPath) {
+  const n = (d.devNodes || []).find(x => x.path === devPath);
+  if (!n) return devPath;
+  const label = devNodeKernelLabel(n);
+  if (!label) return devPath;
+  return `${devPath}  ${label}`;
 }
 
 function buildFallbackRows() {
@@ -607,7 +776,7 @@ function buildFallbackRows() {
         selectKey:d.key,
         parentKey:d.key,
         device:d,
-        text:`${childPrefix}${j === nodes.length - 1 ? '└─' : '├─'} ${n}`,
+        text:`${childPrefix}${j === nodes.length - 1 ? '└─' : '├─'} ${leftDevNodeLabel(d, n)}`,
         selectable:false
       }));
     });
@@ -797,7 +966,7 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
       selectKey:t.key,
       parentKey:t.key,
       device:d,
-      text:`${childPrefix}${nodeIsLast ? '└─' : '├─'} ${n}`,
+      text:`${childPrefix}${nodeIsLast ? '└─' : '├─'} ${leftDevNodeLabel(d, n)}`,
       selectable:false
     });
   });
@@ -907,7 +1076,7 @@ function handleDetailLines(d) {
 
   activeNodes.forEach((n, idx) => {
     lines.push(bold(`${idx + 1}/${activeNodes.length}  ${n.path}`));
-    lines.push(`  Type: ${n.type}`);
+    lines.push(`  Type: ${friendlyDevNodeType(n)}`);
     if (n.iface) lines.push(`  Interface: ${n.iface}`);
     if (n.stat) lines.push(`  Node: ${n.stat}`);
 
@@ -982,13 +1151,13 @@ function driverDetailLines(d) {
   }
 
   lines.push(bold(`Handle summary (${activeNodes.length})`));
-  lines.push('  #   NODE                    IF  SUBSYSTEM  DRIVER        MODEL');
+  lines.push('  #   NODE                    IF  SUBSYSTEM  DRIVER        KERNEL ROLE          MODEL');
   activeNodes.forEach((n, idx) => {
     const iface = driverSummaryValue(n, 'ID_USB_INTERFACE_NUM') || '-';
     const subsystem = driverSummaryValue(n, 'SUBSYSTEM') || '-';
     const driver = driverSummaryValue(n, 'ID_USB_DRIVER') || driverSummaryValue(n, 'DRIVER') || '-';
     const model = driverSummaryValue(n, 'ID_MODEL_FROM_DATABASE') || driverSummaryValue(n, 'ID_MODEL') || '-';
-    lines.push(`  ${rightPadRaw(idx + 1, 3)} ${rightPadRaw(n.path, 23)} ${rightPadRaw(iface, 3)} ${rightPadRaw(subsystem, 10)} ${rightPadRaw(driver, 13)} ${model}`);
+    lines.push(`  ${rightPadRaw(idx + 1, 3)} ${rightPadRaw(n.path, 23)} ${rightPadRaw(iface, 3)} ${rightPadRaw(subsystem, 10)} ${rightPadRaw(driver, 13)} ${rightPadRaw(devNodeKernelLabel(n) || '-', 20)} ${model}`);
   });
   lines.push('');
 
@@ -1000,6 +1169,14 @@ function driverDetailLines(d) {
 
   activeNodes.forEach((n, idx) => {
     lines.push(bold(`${idx + 1}/${activeNodes.length}  ${n.path}`));
+
+    if (n.kernel) {
+      lines.push('  Kernel:');
+      if (n.kernel.role) lines.push(`    ${rightPadRaw('ROLE', 24)} ${n.kernel.role}`);
+      if (n.kernel.name) lines.push(`    ${rightPadRaw('NAME', 24)} ${n.kernel.name}`);
+      if (n.kernel.inputNumber) lines.push(`    ${rightPadRaw('INPUT_NUMBER', 24)} ${n.kernel.inputNumber}`);
+      if (n.kernel.hidraw) lines.push(`    ${rightPadRaw('HIDRAW', 24)} ${n.kernel.hidraw}`);
+    }
 
     for (const [groupName, keys] of keyGroups) {
       const present = keys.filter(k => n.props[k]);
@@ -1040,9 +1217,17 @@ function detailLines(d) {
     lines.push(`Device number: ${d.dev}`);
     lines.push(`Vendor/Product ID: ${d.vid}:${d.pid}`);
     lines.push(`Name: ${d.name || ''}`);
+    if (d.kernel) {
+      if (d.kernel.manufacturer && d.kernel.manufacturer !== d.name) lines.push(`Kernel manufacturer: ${d.kernel.manufacturer}`);
+      if (d.kernel.product) lines.push(`Kernel product: ${d.kernel.product}`);
+      if (d.kernel.bcdDevice) lines.push(`USB bcdDevice: ${d.kernel.bcdDevice}`);
+      if (d.kernel.roles && d.kernel.roles.length) lines.push(`Kernel HID roles: ${d.kernel.roles.join(', ')}`);
+      const hidraws = (d.kernel.hidraw || []).map(h => h.path).filter(Boolean);
+      if (hidraws.length) lines.push(`Kernel hidraw nodes: ${hidraws.join(', ')}`);
+    }
     lines.push('');
     lines.push(bold('Detected /dev handles'));
-    if (activeNodes.length) for (const n of activeNodes) lines.push(`  ${n.path}  ${n.iface ? '(' + n.iface + ')' : ''}  ${n.type}`);
+    if (activeNodes.length) for (const n of activeNodes) lines.push(`  ${n.path}  ${n.iface ? '(' + n.iface + ')' : ''}  ${friendlyDevNodeType(n)}`);
     else lines.push('  None found. Root hubs and some internal devices may not create user-facing /dev nodes.');
     lines.push('');
     lines.push(...suggestions(d));
@@ -1052,8 +1237,11 @@ function detailLines(d) {
     if (!activeNodes.length) lines.push('No matching /dev nodes discovered for this USB device.');
     for (const n of activeNodes) {
       lines.push(bold(n.path));
-      lines.push(`  Type: ${n.type}`);
+      lines.push(`  Type: ${friendlyDevNodeType(n)}`);
       if (n.iface) lines.push(`  Interface: ${n.iface}`);
+      if (n.kernel && n.kernel.role) lines.push(`  Kernel role: ${n.kernel.role}`);
+      if (n.kernel && n.kernel.hidraw) lines.push(`  Kernel hidraw: ${n.kernel.hidraw}`);
+      if (n.kernel && n.kernel.name) lines.push(`  Kernel name: ${n.kernel.name}`);
       if (n.stat) lines.push(`  Node: ${n.stat}`);
       const best = n.links.find(l => l.startsWith('/dev/serial/by-id/')) ||
         n.links.find(l => l.startsWith('/dev/v4l/by-id/')) ||
@@ -1076,7 +1264,10 @@ function detailLines(d) {
 
   } else if (state.tab === 4) {
     lines.push(bold('Recent relevant kernel clues'), '');
-    const relevant = state.lastKernel.filter(l => l.includes(`${Number(d.bus)}-`) || l.toLowerCase().includes((d.name || '').split(' ')[0]?.toLowerCase() || '___') || /usb|ttyUSB|ttyACM|disconnect|attached/i.test(l)).slice(-50);
+    let relevant = d.kernel && d.kernel.lines && d.kernel.lines.length ? d.kernel.lines.slice(-60) : [];
+    if (!relevant.length) {
+      relevant = state.lastKernel.filter(l => l.includes(`${Number(d.bus)}-`) || l.toLowerCase().includes((d.name || '').split(' ')[0]?.toLowerCase() || '___') || /usb|ttyUSB|ttyACM|disconnect|attached/i.test(l)).slice(-50);
+    }
     if (!relevant.length) lines.push('No recent matching kernel lines in dmesg tail.');
     else lines.push(...relevant);
 
@@ -1102,6 +1293,9 @@ function suggestions(d) {
     lines.push('  Camera/capture device: install v4l-utils, then inspect formats with v4l2-ctl --list-formats-ext.');
   } else if (nodes.some(n => /sd[a-z]|nvme/.test(n.path))) {
     lines.push('  Storage device: inspect filesystem/mount with lsblk -f.');
+  } else if (nodes.some(n => /event\d+$/.test(n.path) || /hidraw\d+$/.test(n.path))) {
+    lines.push('  HID/input device: kernel lines can identify keyboard, mouse, consumer-control, system-control, and hidraw functions.');
+    lines.push('  For stable matching, prefer ID_PATH/DEVPATH over event numbers because /dev/input/eventN can change after replug.');
   } else if (/root hub/i.test(d.name)) {
     lines.push(`  Root hub: logical top of USB Bus ${d.bus}. Downstream hubs/devices are shown under it in the left topology tree.`);
   } else {
@@ -1222,7 +1416,7 @@ function ensureSelectedVisualVisible(visualRows, height) {
 
 
 function topHelpLine() {
-  if (!state.showKeys) return 'USB Detective v20260607 —  press k for keyboard mappings';
+  if (!state.showKeys) return 'USB Detective v20260608.1-kernel-harvest —  press k for keyboard mappings';
 
   return 'Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit';
 }
@@ -1233,7 +1427,7 @@ function render() {
   if (!state.lastPollAt && !state.devices.length) {
     const { cols, rows } = termSize();
     let out = '\x1b[?25l\x1b[H';
-    out += pad(cyan('USB Detective v20260607'), cols) + '\n';
+    out += pad(cyan('USB Detective v20260608.1-kernel-harvest'), cols) + '\n';
     out += '─'.repeat(cols) + '\n';
     out += '\n';
     out += pad(state.startupMessage, cols) + '\n';
@@ -1258,7 +1452,7 @@ function render() {
   state.leftRowMap.clear();
 
   let out = '\x1b[?25l\x1b[H';
-  out += pad(cyan('USB Detective v20260607'), cols) + '\n';
+  out += pad(cyan('USB Detective v20260608.1-kernel-harvest'), cols) + '\n';
   out += pad(topHelpLine(), cols) + '\n';
   out += '─'.repeat(cols) + '\n';
 
