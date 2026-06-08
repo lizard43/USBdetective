@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.10';
+const APP_VERSION = 'v20260608.11';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
@@ -125,6 +125,7 @@ function sniffableNodesForDevice(d) {
     if (!n || !n.path) continue;
     if (/^\/dev\/input\/(event\d+|mouse\d+|mice)$/.test(n.path)) out.push({ path: n.path, kind: devNodeShortLabel(n) || n.type || 'input node' });
     else if (/^\/dev\/hidraw\d+$/.test(n.path)) out.push({ path: n.path, kind: 'hidraw node' });
+    else if (/^\/dev\/video\d+$/.test(n.path)) out.push({ path: n.path, kind: devNodeShortLabel(n) || 'video node' });
   }
   return out;
 }
@@ -148,8 +149,9 @@ function parseLsusbLine(line) {
 
 function sniffAddLine(line) {
   const stamp = new Date().toLocaleTimeString();
-  state.sniff.lines.push(`${stamp}  ${line}`);
-  if (state.sniff.lines.length > SNIFF_MAX_LINES) state.sniff.lines.splice(0, state.sniff.lines.length - SNIFF_MAX_LINES);
+  // newest first keeps live captures visible without paging down
+  state.sniff.lines.unshift(`${stamp}  ${line}`);
+  if (state.sniff.lines.length > SNIFF_MAX_LINES) state.sniff.lines.length = SNIFF_MAX_LINES;
   render();
 }
 
@@ -1808,7 +1810,7 @@ function detailLines(d) {
     lines.push(bold('Raw USB / device-node sniffer'), '');
     lines.push('This is a first-pass byte viewer. Press o to open/close the selected node. Press [ or ] to choose a sniff target.');
     lines.push('Raw /dev/bus/usb nodes are usbfs control endpoints, not a passive bus tap; many devices will show little or nothing on read.');
-    lines.push('Input event, mouse, and hidraw nodes are better first sniff targets because they stream kernel-decoded reports.');
+    lines.push('Input event, mouse, hidraw, and video nodes can be selected as sniff targets. Video nodes may require a real capture app/ioctl sequence before data appears.');
     lines.push('');
     lines.push('Basic identity:');
     lines.push(`  Bus ${d.bus} Device ${d.dev}: ID ${d.vid}:${d.pid} ${d.name}`);
@@ -1839,7 +1841,7 @@ function detailLines(d) {
     lines.push(bold('Received bytes'));
     const sniffLines = state.sniff.lines || [];
     if (!sniffLines.length) lines.push('  No bytes yet. Open a node, then move/click/type/use the selected USB device.');
-    else for (const l of sniffLines.slice(-220)) lines.push(`  ${l}`);
+    else for (const l of sniffLines.slice(0, 220)) lines.push(`  ${l}`);
   }
   return lines;
 }
