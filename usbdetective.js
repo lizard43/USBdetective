@@ -30,6 +30,9 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+const APP_VERSION = 'v20260608.2';
+const APP_TITLE = `USB Detective ${APP_VERSION}`;
+
 const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
 const KEEP_REMOVED_MS = Number(process.env.USB_DETECTIVE_KEEP_REMOVED_MS || 4500);
 const HIGHLIGHT_MS = Number(process.env.USB_DETECTIVE_HIGHLIGHT_MS || 5000);
@@ -144,7 +147,7 @@ async function udevProps(devPath) {
 }
 async function symlinkMatches(devPath) {
   const real = await fs.promises.realpath(devPath).catch(() => devPath);
-  const dirs = ['/dev/serial/by-id','/dev/serial/by-path','/dev/disk/by-id','/dev/disk/by-label','/dev/disk/by-uuid','/dev/v4l/by-id','/dev/v4l/by-path'];
+  const dirs = ['/dev/serial/by-id','/dev/serial/by-path','/dev/disk/by-id','/dev/disk/by-label','/dev/disk/by-uuid','/dev/v4l/by-id','/dev/v4l/by-path','/dev/input/by-id','/dev/input/by-path'];
   const out = [];
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) continue;
@@ -399,12 +402,97 @@ function inputKindFromProps(props) {
   if (!props) return '';
   const kinds = [];
   if (props.ID_INPUT_MOUSE) kinds.push('Mouse');
-  if (props.ID_INPUT_KEYBOARD || props.ID_INPUT_KEY) kinds.push('Keyboard/key input');
+  if (props.ID_INPUT_KEYBOARD) kinds.push('Keyboard');
+  else if (props.ID_INPUT_KEY) kinds.push('Keyboard/key input');
   if (props.ID_INPUT_TOUCHPAD) kinds.push('Touchpad');
   if (props.ID_INPUT_JOYSTICK) kinds.push('Joystick/gamepad');
   if (props.ID_INPUT_TABLET) kinds.push('Tablet');
   if (props.ID_INPUT_TOUCHSCREEN) kinds.push('Touchscreen');
   return kinds.join(' + ');
+}
+
+function cleanInputName(name) {
+  return String(name || '').replace(/^["']|["']$/g, '').trim();
+}
+
+function inferInputKindFromSysfs(info) {
+  const name = cleanInputName(info && info.name);
+  if (!name) return '';
+  if (/consumer control/i.test(name)) return 'Consumer Control';
+  if (/system control/i.test(name)) return 'System Control';
+  if (/mouse/i.test(name)) return 'Mouse';
+  if (/keyboard/i.test(name)) return 'Keyboard';
+  if (/joystick|gamepad|xbox|controller/i.test(name)) return 'Joystick/gamepad';
+  if (/touchpad/i.test(name)) return 'Touchpad';
+  if (/camera|video/i.test(name)) return 'Video control';
+  return '';
+}
+
+async function inputSysfsInfo(devPath, props) {
+  const base = path.basename(devPath);
+  if (!/^event\d+$/.test(base)) return null;
+
+  const candidates = [
+    `/sys/class/input/${base}/device`,
+    props && props.DEVPATH ? `/sys${props.DEVPATH}/device` : ''
+  ].filter(Boolean);
+
+  for (const dir of candidates) {
+    try {
+      const name = cleanInputName(await fs.promises.readFile(`${dir}/name`, 'utf8'));
+      const phys = (await fs.promises.readFile(`${dir}/phys`, 'utf8').catch(() => '')).trim();
+      const uniq = (await fs.promises.readFile(`${dir}/uniq`, 'utf8').catch(() => '')).trim();
+      const capsDir = `${dir}/capabilities`;
+      const caps = {};
+      for (const cap of ['ev','key','rel','abs','msc','led','sw']) {
+        const v = (await fs.promises.readFile(`${capsDir}/${cap}`, 'utf8').catch(() => '')).trim();
+        if (v) caps[cap] = v;
+      }
+      return { name, phys, uniq, caps, kind: inferInputKindFromSysfs({ name }) };
+    } catch {}
+  }
+
+  return null;
+}
+
+async function videoNodeInfo(devPath, props) {
+  if (!/^video\d+$/.test(path.basename(devPath))) return null;
+  const info = { name: '', driver: '', card: '', bus: '', formats: [] };
+
+  const devNamePaths = [
+    `/sys/class/video4linux/${path.basename(devPath)}/name`,
+    props && props.DEVPATH ? `/sys${props.DEVPATH}/name` : ''
+  ].filter(Boolean);
+  for (const f of devNamePaths) {
+    const v = (await fs.promises.readFile(f, 'utf8').catch(() => '')).trim();
+    if (v) { info.name = v; break; }
+  }
+
+  const r = await run('v4l2-ctl', ['--device', devPath, '--info'], { timeout: 1800, maxBuffer: 256 * 1024 }).catch(() => ({ ok:false, stdout:'' }));
+  if (r && r.ok && r.stdout) {
+    for (const line of r.stdout.split('\n')) {
+      let m = line.match(/^\s*Driver name\s*:\s*(.*)$/); if (m) info.driver = m[1].trim();
+      m = line.match(/^\s*Card type\s*:\s*(.*)$/); if (m) info.card = m[1].trim();
+      m = line.match(/^\s*Bus info\s*:\s*(.*)$/); if (m) info.bus = m[1].trim();
+    }
+  }
+
+  const fr = await run('v4l2-ctl', ['--device', devPath, '--list-formats-ext'], { timeout: 2200, maxBuffer: 512 * 1024 }).catch(() => ({ ok:false, stdout:'' }));
+  if (fr && fr.ok && fr.stdout) {
+    for (const line of fr.stdout.split('\n')) {
+      const m = line.match(/\[\d+\]:\s+'([^']+)'\s+\((.+)\)/);
+      if (m) info.formats.push(`${m[1]} ${m[2]}`);
+      if (info.formats.length >= 4) break;
+    }
+  }
+
+  return (info.name || info.driver || info.card || info.formats.length) ? info : null;
+}
+
+async function decorateDevNode(record) {
+  record.input = await inputSysfsInfo(record.path, record.props).catch(() => null);
+  record.video = await videoNodeInfo(record.path, record.props).catch(() => null);
+  return record;
 }
 
 function devNodeKernelLabel(n) {
@@ -421,8 +509,9 @@ function devNodeKernelLabel(n) {
 
 function friendlyDevNodeType(n) {
   const baseType = n.type || 'Device node';
-  const label = devNodeKernelLabel(n);
-  return label ? `${baseType} — ${label}` : baseType;
+  const label = devNodeShortLabel(n);
+  if (!label) return baseType;
+  return baseType.includes(label) ? baseType : `${baseType} — ${label}`;
 }
 
 function parseKernelUsbClues(lines) {
@@ -538,7 +627,7 @@ async function enrichDevice(dev, allNodes, blockMap, kernelClues) {
     const bd = busDevFromProps(props);
     const vp = vidPidFromProps(props);
     if (bd === dev.key || (!bd && vp === `${dev.vid}:${dev.pid}`) || (vp === `${dev.vid}:${dev.pid}` && path.basename(node).match(/^(ttyUSB|ttyACM|video|hidraw|event|sd|nvme)/))) {
-      matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node), usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null });
+      matches.push(await decorateDevNode({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node), usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null }));
     }
   }
   // Fallback: some tty nodes do not expose BUSNUM/DEVNUM, but do expose matching VID/PID.
@@ -546,7 +635,7 @@ async function enrichDevice(dev, allNodes, blockMap, kernelClues) {
     for (const node of allNodes) {
       const props = await udevProps(node);
       if (vidPidFromProps(props) === `${dev.vid}:${dev.pid}`) {
-        matches.push({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node), usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null });
+        matches.push(await decorateDevNode({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node), usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null }));
       }
     }
   }
@@ -727,18 +816,42 @@ function deviceInfoLines(t, d) {
   if (classes.length) softwareBits.push(`Class ${classes.join('/')}`);
   const handles = devHandleSummary(d);
   if (handles) softwareBits.push(handles);
-  if (d.kernel && d.kernel.roles && d.kernel.roles.length) softwareBits.push(`HID ${d.kernel.roles.join('/')}`);
 
-  return [identityBits.join('  '), softwareBits.join('  ')];
+  const out = [identityBits.join('  '), softwareBits.join('  ')];
+  if (d.kernel && d.kernel.roles && d.kernel.roles.length) {
+    out.push(`Functions ${d.kernel.roles.join('/')}`);
+  }
+  return out;
 }
 
+
+function devNodeShortLabel(n) {
+  if (!n) return '';
+  const kernelLabel = devNodeKernelLabel(n);
+  if (kernelLabel) return kernelLabel;
+
+  const propKind = inputKindFromProps(n.props || {});
+  if (propKind) return propKind;
+
+  if (n.input) {
+    if (n.input.kind) return n.input.kind;
+    if (n.input.name) return cleanInputName(n.input.name);
+  }
+
+  if (n.video) {
+    return n.video.card || n.video.name || 'Video capture';
+  }
+
+  if (/^hidraw\d+$/.test(path.basename(n.path))) return 'Raw HID';
+  if (/^video\d+$/.test(path.basename(n.path))) return 'Video capture';
+  return '';
+}
 
 function leftDevNodeLabel(d, devPath) {
   const n = (d.devNodes || []).find(x => x.path === devPath);
   if (!n) return devPath;
-  const label = devNodeKernelLabel(n);
-  if (!label) return devPath;
-  return `${devPath}  ${label}`;
+  const label = devNodeShortLabel(n);
+  return label ? `${devPath}  ${label}` : devPath;
 }
 
 function buildFallbackRows() {
@@ -761,15 +874,17 @@ function buildFallbackRows() {
       });
       const nodes = (d.devNodes || []).map(n => n.path).sort();
       const metaPrefix = childPrefix + (nodes.length ? '│  ' : '   ');
-      rows.push({
+      const fallbackInfo = [`Bus ${d.bus}  Dev ${d.dev}  ID ${d.vid}:${d.pid}${d.devNodes && d.devNodes.length ? `  Handles ${d.devNodes.length}` : ''}`];
+      if (d.kernel && d.kernel.roles && d.kernel.roles.length) fallbackInfo.push(`Functions ${d.kernel.roles.join('/')}`);
+      fallbackInfo.forEach((line, idx) => rows.push({
         type:'meta',
-        key:`${d.key}:meta`,
+        key:`${d.key}:meta${idx || ''}`,
         selectKey:d.key,
         parentKey:d.key,
         device:d,
-        text:`${metaPrefix}Bus ${d.bus}  Dev ${d.dev}  ID ${d.vid}:${d.pid}${d.devNodes && d.devNodes.length ? `  Handles ${d.devNodes.length}` : ''}`,
+        text:`${metaPrefix}${line}`,
         selectable:false
-      });
+      }));
       nodes.forEach((n, j) => rows.push({
         type:'node',
         key:`${d.key}:${n}`,
@@ -929,29 +1044,17 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
   // inside that device's branch. If the device has downstream children or /dev
   // handles, keep an internal vertical pipe running through the metadata lines.
   const metaPrefix = childPrefix + (hasChildRows ? '│  ' : '   ');
-  const infoLines = deviceInfoLines(t, d);
-  rows.push({
+  const infoLines = deviceInfoLines(t, d).filter(Boolean);
+  infoLines.forEach((line, idx) => rows.push({
     type:'meta',
-    key:`${t.key}:meta`,
+    key:`${t.key}:meta${idx || ''}`,
     selectKey:t.key,
     parentKey:t.key,
     device:d,
     topo:t,
-    text:`${metaPrefix}${infoLines[0]}`,
+    text:`${metaPrefix}${line}`,
     selectable:false
-  });
-  if (infoLines[1]) {
-    rows.push({
-      type:'meta',
-      key:`${t.key}:meta2`,
-      selectKey:t.key,
-      parentKey:t.key,
-      device:d,
-      topo:t,
-      text:`${metaPrefix}${infoLines[1]}`,
-      selectable:false
-    });
-  }
+  }));
 
   children.forEach((c, i) => {
     const childIsLast = i === children.length - 1 && nodes.length === 0;
@@ -1079,6 +1182,11 @@ function handleDetailLines(d) {
     lines.push(`  Type: ${friendlyDevNodeType(n)}`);
     if (n.iface) lines.push(`  Interface: ${n.iface}`);
     if (n.stat) lines.push(`  Node: ${n.stat}`);
+    if (n.input && n.input.name) lines.push(`  Input name: ${n.input.name}`);
+    if (n.video) {
+      const vb = [n.video.card || n.video.name, n.video.driver].filter(Boolean).join(' / ');
+      if (vb) lines.push(`  Video: ${vb}`);
+    }
 
     const best = n.links.find(l => l.startsWith('/dev/serial/by-id/')) ||
       n.links.find(l => l.startsWith('/dev/v4l/by-id/')) ||
@@ -1242,6 +1350,17 @@ function detailLines(d) {
       if (n.kernel && n.kernel.role) lines.push(`  Kernel role: ${n.kernel.role}`);
       if (n.kernel && n.kernel.hidraw) lines.push(`  Kernel hidraw: ${n.kernel.hidraw}`);
       if (n.kernel && n.kernel.name) lines.push(`  Kernel name: ${n.kernel.name}`);
+      if (n.input) {
+        if (n.input.name) lines.push(`  Input name: ${n.input.name}`);
+        if (n.input.phys) lines.push(`  Input phys: ${n.input.phys}`);
+      }
+      if (n.video) {
+        if (n.video.name) lines.push(`  Video name: ${n.video.name}`);
+        if (n.video.driver) lines.push(`  Video driver: ${n.video.driver}`);
+        if (n.video.card) lines.push(`  Video card: ${n.video.card}`);
+        if (n.video.bus) lines.push(`  Video bus: ${n.video.bus}`);
+        if (n.video.formats && n.video.formats.length) lines.push(`  Video formats: ${n.video.formats.join(', ')}`);
+      }
       if (n.stat) lines.push(`  Node: ${n.stat}`);
       const best = n.links.find(l => l.startsWith('/dev/serial/by-id/')) ||
         n.links.find(l => l.startsWith('/dev/v4l/by-id/')) ||
@@ -1416,7 +1535,7 @@ function ensureSelectedVisualVisible(visualRows, height) {
 
 
 function topHelpLine() {
-  if (!state.showKeys) return 'USB Detective v20260608.1 —  press k for keyboard mappings';
+  if (!state.showKeys) return `${APP_TITLE} —  press k for keyboard mappings`;
 
   return 'Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit';
 }
@@ -1427,7 +1546,7 @@ function render() {
   if (!state.lastPollAt && !state.devices.length) {
     const { cols, rows } = termSize();
     let out = '\x1b[?25l\x1b[H';
-    out += pad(cyan('USB Detective v20260608.1 '), cols) + '\n';
+    out += pad(cyan(APP_TITLE + ' '), cols) + '\n';
     out += '─'.repeat(cols) + '\n';
     out += '\n';
     out += pad(state.startupMessage, cols) + '\n';
@@ -1452,7 +1571,7 @@ function render() {
   state.leftRowMap.clear();
 
   let out = '\x1b[?25l\x1b[H';
-  out += pad(cyan('USB Detective v20260608.1 '), cols) + '\n';
+  out += pad(cyan(APP_TITLE + ' '), cols) + '\n';
   out += pad(topHelpLine(), cols) + '\n';
   out += '─'.repeat(cols) + '\n';
 
