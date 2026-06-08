@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.3';
+const APP_VERSION = 'v20260608.4';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
@@ -548,6 +548,11 @@ async function videoNodeInfo(devPath, props) {
       let m = line.match(/^\s*Driver name\s*:\s*(.*)$/); if (m) info.driver = m[1].trim();
       m = line.match(/^\s*Card type\s*:\s*(.*)$/); if (m) info.card = m[1].trim();
       m = line.match(/^\s*Bus info\s*:\s*(.*)$/); if (m) info.bus = m[1].trim();
+      m = line.match(/^\s*Device Caps\s*:\s*(.*)$/); if (m) info.deviceCapsRaw = m[1].trim();
+      if (/Video Capture/i.test(line)) info.hasVideoCapture = true;
+      if (/Video Output/i.test(line)) info.hasVideoOutput = true;
+      if (/Metadata Capture/i.test(line)) info.hasMetadataCapture = true;
+      if (/Streaming/i.test(line)) info.hasStreaming = true;
     }
   }
 
@@ -560,7 +565,12 @@ async function videoNodeInfo(devPath, props) {
     }
   }
 
-  return (info.name || info.driver || info.card || info.formats.length) ? info : null;
+  if (info.formats.length) info.role = 'Video capture';
+  else if (info.hasVideoCapture) info.role = 'Video capture';
+  else if (info.hasMetadataCapture) info.role = 'Metadata/control';
+  else if (info.name || info.card) info.role = 'Video node';
+
+  return (info.name || info.driver || info.card || info.formats.length || info.role) ? info : null;
 }
 
 async function decorateDevNode(record) {
@@ -900,8 +910,45 @@ function deviceInfoLines(t, d) {
 }
 
 
+function sameLooseName(a, b) {
+  const clean = x => String(x || '')
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/[^a-z0-9 ]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const aa = clean(a);
+  const bb = clean(b);
+  return !!aa && !!bb && (aa === bb || aa.includes(bb) || bb.includes(aa));
+}
+
+function genericInputLabel(n) {
+  const name = cleanInputName(n && n.input && n.input.name);
+  const model = (n && n.props && (n.props.ID_MODEL || n.props.ID_MODEL_FROM_DATABASE)) || '';
+  const serial = (n && n.props && n.props.ID_SERIAL) || '';
+
+  // Some HID collections expose no specific udev role. The sysfs name then
+  // often repeats only the USB product string, which is not useful in the tree.
+  if (sameLooseName(name, model) || sameLooseName(name, serial)) return 'Generic HID input';
+  if (/usb device$/i.test(name) || /2\.4g receiver$/i.test(name)) return 'Generic HID input';
+  return name || 'Generic HID input';
+}
+
+function videoShortLabel(n) {
+  if (!n || !n.video) return '';
+  const role = n.video.role || (n.video.formats && n.video.formats.length ? 'Video capture' : 'Video node');
+  const card = n.video.card || n.video.name || '';
+
+  if (/metadata|control/i.test(role)) return card ? `${card} metadata/control` : 'Metadata/control';
+  if (/capture/i.test(role)) return card ? `${card} capture` : 'Video capture';
+  return card ? `${card} ${role}` : role;
+}
+
 function devNodeShortLabel(n) {
   if (!n) return '';
+
+  if (n.video) return videoShortLabel(n);
+
   const kernelLabel = devNodeKernelLabel(n);
   if (kernelLabel) return kernelLabel;
 
@@ -910,15 +957,11 @@ function devNodeShortLabel(n) {
 
   if (n.input) {
     if (n.input.kind) return n.input.kind;
-    if (n.input.name) return cleanInputName(n.input.name);
-  }
-
-  if (n.video) {
-    return n.video.card || n.video.name || 'Video capture';
+    return genericInputLabel(n);
   }
 
   if (/^hidraw\d+$/.test(path.basename(n.path))) return 'Raw HID';
-  if (/^video\d+$/.test(path.basename(n.path))) return 'Video capture';
+  if (/^video\d+$/.test(path.basename(n.path))) return 'Video node';
   return '';
 }
 
@@ -1258,9 +1301,12 @@ function handleDetailLines(d) {
     if (n.iface) lines.push(`  Interface: ${n.iface}`);
     if (n.stat) lines.push(`  Node: ${n.stat}`);
     if (n.devIdentity && Number(n.devIdentity.rdev || 0) > 0) lines.push(`  Device ID: major/minor ${n.devIdentity.major}:${n.devIdentity.minor}`);
-    if (n.input && n.input.name) lines.push(`  Input name: ${n.input.name}`);
+    if (n.input && n.input.name) {
+      lines.push(`  Input name: ${n.input.name}`);
+      if (devNodeShortLabel(n) === 'Generic HID input') lines.push('  Input role: generic HID collection; kernel/udev did not expose a more specific role');
+    }
     if (n.video) {
-      const vb = [n.video.card || n.video.name, n.video.driver].filter(Boolean).join(' / ');
+      const vb = [videoShortLabel(n), n.video.driver].filter(Boolean).join(' / ');
       if (vb) lines.push(`  Video: ${vb}`);
     }
 
@@ -1442,9 +1488,11 @@ function detailLines(d) {
       if (n.kernel && n.kernel.name) lines.push(`  Kernel name: ${n.kernel.name}`);
       if (n.input) {
         if (n.input.name) lines.push(`  Input name: ${n.input.name}`);
+        if (devNodeShortLabel(n) === 'Generic HID input') lines.push('  Input role: generic HID collection; kernel/udev did not expose a more specific role');
         if (n.input.phys) lines.push(`  Input phys: ${n.input.phys}`);
       }
       if (n.video) {
+        if (n.video.role) lines.push(`  Video role: ${n.video.role}`);
         if (n.video.name) lines.push(`  Video name: ${n.video.name}`);
         if (n.video.driver) lines.push(`  Video driver: ${n.video.driver}`);
         if (n.video.card) lines.push(`  Video card: ${n.video.card}`);
@@ -1624,10 +1672,11 @@ function ensureSelectedVisualVisible(visualRows, height) {
 }
 
 
-function topHelpLine() {
-  if (!state.showKeys) return `${APP_TITLE} —  press k for keyboard mappings`;
+function titleHelpLine() {
+  const title = green(APP_TITLE);
+  if (!state.showKeys) return `${title} —  press k for keyboard mappings`;
 
-  return 'Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit';
+  return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit`;
 }
 
 function render() {
@@ -1636,7 +1685,7 @@ function render() {
   if (!state.lastPollAt && !state.devices.length) {
     const { cols, rows } = termSize();
     let out = '\x1b[?25l\x1b[H';
-    out += pad(cyan(APP_TITLE + ' '), cols) + '\n';
+    out += pad(green(APP_TITLE + ' '), cols) + '\n';
     out += '─'.repeat(cols) + '\n';
     out += '\n';
     out += pad(state.startupMessage, cols) + '\n';
@@ -1661,8 +1710,7 @@ function render() {
   state.leftRowMap.clear();
 
   let out = '\x1b[?25l\x1b[H';
-  out += pad(cyan(APP_TITLE + ' '), cols) + '\n';
-  out += pad(topHelpLine(), cols) + '\n';
+  out += pad(titleHelpLine(), cols) + '\n';
   out += '─'.repeat(cols) + '\n';
 
   const d = selectedDevice();
