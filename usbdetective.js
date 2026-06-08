@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.11';
+const APP_VERSION = 'v20260608.12';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
@@ -110,7 +110,7 @@ let state = {
   previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
   leftRowMap: new Map(), lastPollAt: null,
-  sniff: { fd: null, path: '', kind: '', active: false, opening: false, lines: [], bytes: 0, reads: 0, error: '', targetIndex: 0 }
+  sniff: { fd: null, path: '', kind: '', active: false, opening: false, lines: [], bytes: 0, reads: 0, error: '', failPath: '', targetIndex: 0 }
 };
 const tabs = ['Summary', '/dev', 'Handles', 'Driver', 'Kernel', 'Raw USB'];
 
@@ -213,7 +213,7 @@ function toggleSniffer() {
   if (state.sniff.active || state.sniff.opening) { closeSniffer('closed'); return; }
   const target = selectedSniffTarget();
   if (!target) {
-    state.status = 'No raw/input/hidraw node available to sniff on selected device';
+    state.status = 'No raw/input/hidraw/video node available to sniff on selected device';
     render();
     return;
   }
@@ -221,6 +221,7 @@ function toggleSniffer() {
   state.sniff.path = target.path;
   state.sniff.kind = target.kind || '';
   state.sniff.error = '';
+  state.sniff.failPath = '';
   state.sniff.lines = [];
   state.sniff.bytes = 0;
   state.sniff.reads = 0;
@@ -230,6 +231,7 @@ function toggleSniffer() {
     state.sniff.opening = false;
     if (err) {
       state.sniff.error = `${err.code || 'open error'} ${err.message || err}`;
+      state.sniff.failPath = target.path;
       sniffAddLine(`open failed: ${state.sniff.error}`);
       state.status = `Sniffer open failed for ${target.path}`;
       render();
@@ -1711,6 +1713,19 @@ function driverDetailLines(d) {
   return lines;
 }
 
+
+function sniffTargetStatusText(t) {
+  if (!t || !t.path) return '';
+  if (state.sniff.active && state.sniff.path === t.path) return green('OPEN');
+  if (!state.sniff.active && !state.sniff.opening && state.sniff.failPath === t.path && state.sniff.error) return red('FAIL');
+  if (state.sniff.opening && state.sniff.path === t.path) return yellow('OPENING');
+  return '';
+}
+
+function sniffTargetHelpLine() {
+  return `${bold('Sniff targets')}  ${dim('[ / ] choose target   o open/close selected target')}`;
+}
+
 function detailLines(d) {
   if (!d) return ['No USB devices found.'];
   const lines = [];
@@ -1820,14 +1835,15 @@ function detailLines(d) {
       if (d.rawUsbStat) lines.push(`  ${d.rawUsbStat}`);
     }
     lines.push('');
-    lines.push(bold('Sniff targets'));
+    lines.push(sniffTargetHelpLine());
     if (!targets.length) {
       lines.push('  No raw/input/hidraw target available for this selected device.');
     } else {
       targets.forEach((t, idx) => {
         const marker = target && t.path === target.path ? '>' : ' ';
-        const live = state.sniff.active && state.sniff.path === t.path ? '  OPEN' : '';
-        lines.push(`  ${marker} ${idx + 1}. ${t.path}  ${t.kind}${live}`);
+        const status = sniffTargetStatusText(t);
+        const statusText = status ? `  ${status}` : '';
+        lines.push(`  ${marker} ${idx + 1}. ${t.path}  ${t.kind}${statusText}`);
       });
     }
     lines.push('');
@@ -2130,6 +2146,7 @@ function handleInput(buf) {
 async function main() {
   process.on('exit', cleanup);
   process.on('SIGINT', () => { cleanup(); process.exit(0); });
+  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true);
     process.stdin.resume();
