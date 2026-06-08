@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.17';
+const APP_VERSION = 'v20260608.18';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 // Heavy handle detection can walk /proc and run lsof/fuser.
@@ -132,12 +132,14 @@ let state = {
 };
 
 const SNIFF_MAX_LINES = 500;
-const SNIFF_READ_SIZE = 64;
+const SNIFF_READ_SIZE = 4096;
 const SNIFF_VIEW_MODES = ['smart', 'hex', 'ascii', 'both'];
 
 function sniffableNodesForDevice(d) {
   if (!d) return [];
   const out = [];
+  const usbmon = d.bus ? `/sys/kernel/debug/usb/usbmon/${Number(d.bus)}u` : '';
+  if (usbmon && fs.existsSync(usbmon)) out.push({ path: usbmon, kind: 'usbmon bus text tap' });
   if (d.rawUsbNode || d.rawUsb) out.push({ path: d.rawUsbNode || d.rawUsb, kind: 'raw usbfs device' });
   for (const n of d.devNodes || []) {
     if (!n || !n.path) continue;
@@ -221,10 +223,121 @@ function decodeInputEventChunk(chunk) {
   return out;
 }
 
+
+function usbDescriptorTypeName(t) {
+  return ({1: 'DEVICE', 2: 'CONFIGURATION', 3: 'STRING', 4: 'INTERFACE', 5: 'ENDPOINT', 6: 'DEVICE_QUALIFIER', 7: 'OTHER_SPEED_CONFIGURATION', 11: 'IAD', 15: 'BOS'}[t]) || `DESC_${t}`;
+}
+
+function usbClassName(cls, sub, proto) {
+  if (cls === 0x00) return 'per-interface';
+  if (cls === 0x03) return 'HID';
+  if (cls === 0x08) return sub === 0x06 && proto === 0x50 ? 'Mass Storage / SCSI transparent / Bulk-Only Transport' : 'Mass Storage';
+  if (cls === 0x09) return 'Hub';
+  if (cls === 0x0e) return 'Video';
+  if (cls === 0xff) return 'Vendor specific';
+  return `class 0x${cls.toString(16).padStart(2, '0')}`;
+}
+
+function decodeUsbDescriptorBlob(buf) {
+  const b = Buffer.from(buf || []);
+  const out = [];
+  let off = 0;
+
+  while (off + 2 <= b.length) {
+    const len = b[off];
+    const type = b[off + 1];
+    if (len < 2 || off + len > b.length) break;
+    const d = b.subarray(off, off + len);
+    const at = `+${off}`;
+
+    if (type === 1 && len >= 18) {
+      const bcdUSB = d.readUInt16LE(2);
+      const cls = d[4], sub = d[5], proto = d[6];
+      const vid = d.readUInt16LE(8).toString(16).padStart(4, '0');
+      const pid = d.readUInt16LE(10).toString(16).padStart(4, '0');
+      const bcdDev = d.readUInt16LE(12);
+      out.push(`${at} DEVICE descriptor: USB ${(bcdUSB >> 8)}.${String(bcdUSB & 0xff).padStart(2, '0')} maxPacket0 ${d[7]} VID:PID ${vid}:${pid} bcdDevice ${(bcdDev >> 8)}.${String(bcdDev & 0xff).padStart(2, '0')} class ${usbClassName(cls, sub, proto)} strings mfr=${d[14]} product=${d[15]} serial=${d[16]} configs=${d[17]}`);
+    } else if (type === 2 && len >= 9) {
+      out.push(`${at} CONFIG descriptor: totalLength ${d.readUInt16LE(2)} interfaces ${d[4]} configurationValue ${d[5]} attributes 0x${d[7].toString(16).padStart(2, '0')} maxPower ${d[8] * 2}mA`);
+    } else if (type === 4 && len >= 9) {
+      const cls = d[5], sub = d[6], proto = d[7];
+      out.push(`${at} INTERFACE descriptor: if${d[2]} alt${d[3]} endpoints ${d[4]} ${usbClassName(cls, sub, proto)}`);
+    } else if (type === 5 && len >= 7) {
+      const ep = d[2];
+      const dir = ep & 0x80 ? 'IN' : 'OUT';
+      const num = ep & 0x0f;
+      const attr = d[3] & 0x03;
+      const transfer = ['Control', 'Isochronous', 'Bulk', 'Interrupt'][attr] || `type${attr}`;
+      out.push(`${at} ENDPOINT descriptor: ep${num} ${dir} ${transfer} maxPacket ${d.readUInt16LE(4)} interval ${d[6]}`);
+    } else {
+      out.push(`${at} ${usbDescriptorTypeName(type)} descriptor len ${len}: ${bytesToHex(d)}`);
+    }
+    off += len;
+  }
+
+  if (!out.length) return [];
+  if (off < b.length) out.push(`+${off} undecoded trailing bytes: ${bytesToHex(b.subarray(off))}`);
+  return out;
+}
+
+function looksLikeUsbDescriptorBlob(buf) {
+  const b = Buffer.from(buf || []);
+  if (b.length < 2) return false;
+  if (b[0] === 18 && b[1] === 1) return true;
+  if (b[0] === 9 && (b[1] === 2 || b[1] === 4)) return true;
+  return false;
+}
+
+function storageNodes(d) {
+  return (d && d.devNodes || []).filter(n => n.block || /^\/dev\/(sd[a-z]\d*|nvme\d+n\d+(p\d+)?)$/.test(n.path || ''));
+}
+
+function storageDetailLines(d) {
+  const lines = [];
+  const nodes = storageNodes(d);
+  if (!nodes.length) return lines;
+
+  lines.push(bold('Mass-storage / block details'));
+  lines.push('  Raw USB traffic is handled by the usb-storage driver. The useful user-facing nodes are the block disk and partitions below.');
+  lines.push('  For mounted media, sniffing /dev/bus/usb usually shows descriptors only; filesystem reads happen through the kernel block layer.');
+  lines.push('');
+
+  for (const n of nodes) {
+    const b = n.block || {};
+    lines.push(bold(`  ${n.path}`));
+    lines.push(`    Type: ${b.type || 'block'}  Size: ${b.size || '?'}  Transport: ${b.tran || 'usb'}  Removable: ${String(b.rm ?? '')}`);
+    if (b.vendor || b.model || b.serial) lines.push(`    Identity: ${[b.vendor, b.model, b.serial].filter(Boolean).join(' / ')}`);
+    if (b.fstype || b.label || b.uuid || b.partuuid) lines.push(`    FS: ${[b.fstype, b.label, b.uuid ? 'UUID ' + b.uuid : '', b.partuuid ? 'PARTUUID ' + b.partuuid : ''].filter(Boolean).join('  ')}`);
+    const mounts = (b.mountpoints || []).filter(Boolean);
+    if (mounts.length) lines.push(`    Mounted at: ${mounts.join(', ')}`);
+    if (n.stat) lines.push(`    Node: ${n.stat}`);
+    const stable = bestStableName(n);
+    if (stable) lines.push(`    Stable: ${stable}`);
+  }
+
+  lines.push('');
+  lines.push('  Good external commands for this exact device:');
+  for (const n of nodes) {
+    lines.push(`    lsblk -f ${n.path}`);
+    lines.push(`    udevadm info --query=all --name ${n.path}`);
+  }
+  const disk = nodes.find(n => n.block && n.block.type === 'disk') || nodes[0];
+  if (disk) {
+    lines.push(`    sudo fdisk -l ${disk.path}`);
+    lines.push(`    sudo blockdev --getsize64 ${disk.path}`);
+    lines.push(`    sudo hdparm -I ${disk.path}  # often limited through USB bridges`);
+  }
+  lines.push('');
+  return lines;
+}
+
 function formatSniffChunk(chunk) {
   const b = Buffer.from(chunk || []);
   const mode = state.sniff.viewMode || 'smart';
   const isInputEvent = /^\/dev\/input\/event\d+$/.test(state.sniff.path || '');
+  const isUsbmon = /usbmon/.test(state.sniff.kind || '') || /\/usbmon\//.test(state.sniff.path || '');
+
+  if (isUsbmon && mode === 'smart') return `${rightPadRaw(b.length, 4)} bytes  ${b.toString('utf8').replace(/\n/g, ' ; ').trim()}`;
 
   if (mode === 'hex') return `${rightPadRaw(b.length, 4)} bytes  ${bytesToHex(b)}`;
   if (mode === 'ascii') return `${rightPadRaw(b.length, 4)} bytes  ascii |${bytesToAscii(b)}|`;
@@ -234,6 +347,10 @@ function formatSniffChunk(chunk) {
     const decoded = decodeInputEventChunk(b);
     if (decoded.length) return `${rightPadRaw(b.length, 4)} bytes  ${decoded.join(' ; ')}`;
     return `${rightPadRaw(b.length, 4)} bytes  waiting for full input_event (${(state.sniff.partial || Buffer.alloc(0)).length}/24 bytes)`;
+  }
+  if (looksLikeUsbDescriptorBlob(b)) {
+    const decoded = decodeUsbDescriptorBlob(b);
+    if (decoded.length) return `${rightPadRaw(b.length, 4)} bytes  ${decoded.join(' ; ')}`;
   }
   return `${rightPadRaw(b.length, 4)} bytes  ${hexDump(b)}`;
 }
@@ -666,7 +783,7 @@ async function getHandleUsers(devPath) {
 }
 
 async function getLsblkJson() {
-  const r = await run('lsblk', ['-J', '-o', 'NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,MODEL,SERIAL,TRAN,RM,MOUNTPOINTS'], { timeout: 3000, maxBuffer: 2 * 1024 * 1024 });
+  const r = await run('lsblk', ['-J', '-o', 'NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,UUID,PARTUUID,MODEL,SERIAL,TRAN,RM,HOTPLUG,ROTA,MOUNTPOINTS,VENDOR'], { timeout: 3000, maxBuffer: 2 * 1024 * 1024 });
   try { return JSON.parse(r.stdout || '{}'); } catch { return {}; }
 }
 function flattenBlock(tree, arr = []) {
@@ -1935,6 +2052,7 @@ function detailLines(d) {
     if (activeNodes.length) for (const n of activeNodes) lines.push(`  ${n.path}  ${n.iface ? '(' + n.iface + ')' : ''}  ${friendlyDevNodeType(n)}${bestStableName(n) ? '  → ' + bestStableName(n) : ''}`);
     else lines.push('  None found. Root hubs and some internal devices may not create user-facing /dev nodes.');
     lines.push('');
+    lines.push(...storageDetailLines(d));
     lines.push(...suggestions(d));
 
   } else if (state.tab === DEV) {
@@ -2011,12 +2129,16 @@ function detailLines(d) {
     const target = selectedSniffTarget(d);
 
     lines.push(bold('Raw USB / device-node sniffer'), '');
-    lines.push('Raw /dev/bus/usb nodes are usbfs control endpoints, not a passive bus tap; many devices will show little or nothing on read.');
+    lines.push('Raw /dev/bus/usb nodes are usbfs control endpoints, not a passive bus tap; many devices will show little or nothing on read. If usbmon is mounted/readable, this tab also offers a real bus-level usbmon text tap.');
     lines.push('Input event, mouse, hidraw, and video nodes can be selected as sniff targets. Video nodes may require a real capture app/ioctl sequence before data appears.');
     lines.push('');
     lines.push('Basic identity:');
     lines.push(`  Bus ${d.bus} Device ${d.dev}: ID ${d.vid}:${d.pid} ${d.name}`);
     lines.push(`  Descriptor command: lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`);
+    if (storageNodes(d).length) {
+      lines.push(`  Storage/block commands: lsblk -f ${storageNodes(d).map(n => n.path).join(' ')} ; sudo fdisk -l ${storageNodes(d)[0].path}`);
+      lines.push('  Note: usbfs reads show descriptors/control data, not normal file reads after usb-storage binds the device.');
+    }
     if (d.rawUsbNode || d.rawUsb) {
       lines.push(`  Raw USB node: ${d.rawUsbNode || d.rawUsb}`);
       if (d.rawUsbStat) lines.push(`  ${d.rawUsbStat}`);
@@ -2061,7 +2183,8 @@ function suggestions(d) {
   } else if (nodes.some(n => /video\d+$/.test(n.path))) {
     lines.push('  Camera/capture device: install v4l-utils, then inspect formats with v4l2-ctl --list-formats-ext.');
   } else if (nodes.some(n => /sd[a-z]|nvme/.test(n.path))) {
-    lines.push('  Storage device: inspect filesystem/mount with lsblk -f.');
+    lines.push('  Storage device: /dev/sdX is the whole disk; /dev/sdX1 is a partition/filesystem. Prefer /dev/disk/by-id or UUID for stable scripts.');
+    lines.push('  Deep checks: lsblk -f, sudo fdisk -l, udevadm info, dmesg, and /sys/block/<disk>/device details.');
   } else if (nodes.some(n => /event\d+$/.test(n.path) || /hidraw\d+$/.test(n.path) || /hiddev\d+$/.test(n.path))) {
     lines.push('  HID/input device: kernel lines can identify keyboard, mouse, consumer-control, system-control, and hidraw functions.');
     lines.push('  For stable matching, prefer ID_PATH/DEVPATH over event numbers because /dev/input/eventN can change after replug.');
