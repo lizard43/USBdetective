@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.5';
+const APP_VERSION = 'v20260608.6';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
@@ -46,6 +46,7 @@ const C = {
 function color(code, s) { return USE_COLOR ? code + s + C.reset : s; }
 function bold(s) { return color(C.bold, s); }
 function green(s) { return color(C.green + C.bold, s); }
+function titleGreen(s) { return USE_COLOR ? '\x1b[38;5;71m' + C.bold + s + C.reset : s; }
 function red(s) { return color(C.red + C.bold, s); }
 function yellow(s) { return color(C.yellow + C.bold, s); }
 function cyan(s) { return color(C.cyan + C.bold, s); }
@@ -944,8 +945,29 @@ function videoShortLabel(n) {
   return card ? `${card} ${role}` : role;
 }
 
+function serialShortLabel(n) {
+  if (!n || !n.path) return '';
+  const base = path.basename(n.path);
+  if (!/^ttyUSB\d+$/.test(base) && !/^ttyACM\d+$/.test(base)) return '';
+
+  const ifaceNum = n.props && n.props.ID_USB_INTERFACE_NUM;
+  const iface = interfaceLabel(n.props || '');
+  if (/^ttyUSB\d+$/.test(base)) {
+    if (ifaceNum === '00') return 'Serial Channel A';
+    if (ifaceNum === '01') return 'Serial Channel B';
+    if (ifaceNum === '02') return 'Serial Channel C';
+    if (ifaceNum === '03') return 'Serial Channel D';
+    return iface ? `USB serial — ${iface}` : 'USB serial';
+  }
+
+  return iface ? `CDC/ACM serial — ${iface}` : 'CDC/ACM serial';
+}
+
 function devNodeShortLabel(n) {
   if (!n) return '';
+
+  const serialLabel = serialShortLabel(n);
+  if (serialLabel) return serialLabel;
 
   if (n.video) return videoShortLabel(n);
 
@@ -1741,7 +1763,7 @@ function ensureSelectedVisualVisible(visualRows, height) {
 
 
 function titleHelpLine() {
-  const title = green(APP_TITLE);
+  const title = titleGreen(APP_TITLE);
   if (!state.showKeys) return `${title} —  press k for keyboard mappings`;
 
   return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit`;
@@ -1753,7 +1775,7 @@ function render() {
   if (!state.lastPollAt && !state.devices.length) {
     const { cols, rows } = termSize();
     let out = '\x1b[?25l\x1b[H';
-    out += pad(green(APP_TITLE + ' '), cols) + '\n';
+    out += pad(titleGreen(APP_TITLE + ' '), cols) + '\n';
     out += '─'.repeat(cols) + '\n';
     out += '\n';
     out += pad(state.startupMessage, cols) + '\n';
