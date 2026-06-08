@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.9';
+const APP_VERSION = 'v20260608.10';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 const POLL_MS = Number(process.env.USB_DETECTIVE_POLL_MS || 1000);
@@ -109,9 +109,33 @@ let state = {
   devices: [], rows: [], selectedKey: null, selectedRowKey: null, selectedIndex: 0, detailScroll: 0, leftScroll: 0, tab: 0,
   previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
-  leftRowMap: new Map(), lastPollAt: null
+  leftRowMap: new Map(), lastPollAt: null,
+  sniff: { fd: null, path: '', kind: '', active: false, opening: false, lines: [], bytes: 0, reads: 0, error: '', targetIndex: 0 }
 };
 const tabs = ['Summary', '/dev', 'Handles', 'Driver', 'Kernel', 'Raw USB'];
+
+const SNIFF_MAX_LINES = 500;
+const SNIFF_READ_SIZE = 64;
+
+function sniffableNodesForDevice(d) {
+  if (!d) return [];
+  const out = [];
+  if (d.rawUsbNode || d.rawUsb) out.push({ path: d.rawUsbNode || d.rawUsb, kind: 'raw usbfs device' });
+  for (const n of d.devNodes || []) {
+    if (!n || !n.path) continue;
+    if (/^\/dev\/input\/(event\d+|mouse\d+|mice)$/.test(n.path)) out.push({ path: n.path, kind: devNodeShortLabel(n) || n.type || 'input node' });
+    else if (/^\/dev\/hidraw\d+$/.test(n.path)) out.push({ path: n.path, kind: 'hidraw node' });
+  }
+  return out;
+}
+
+function hexDump(buf) {
+  const b = Buffer.from(buf || []);
+  const hex = [...b].map(x => x.toString(16).padStart(2, '0')).join(' ');
+  const asc = [...b].map(x => x >= 32 && x <= 126 ? String.fromCharCode(x) : '.').join('');
+  return `${hex}  |${asc}|`;
+}
+
 
 function parseLsusbLine(line) {
   const m = line.match(/^Bus\s+(\d+)\s+Device\s+(\d+):\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\s*(.*)$/);
@@ -119,6 +143,104 @@ function parseLsusbLine(line) {
   const [, bus, dev, vid, pid, name] = m;
   const rawUsbNode = rawUsbNodePath(bus, dev);
   return { bus, dev, vid: vid.toLowerCase(), pid: pid.toLowerCase(), name: (name || '').trim(), key: `${bus}:${dev}`, devNodes: [], links: [], props: {}, block: null, videoInfo: '', rawUsb: rawUsbNode, rawUsbNode, rawUsbStat: '', rawUsbUsers: null, removed: false };
+}
+
+
+function sniffAddLine(line) {
+  const stamp = new Date().toLocaleTimeString();
+  state.sniff.lines.push(`${stamp}  ${line}`);
+  if (state.sniff.lines.length > SNIFF_MAX_LINES) state.sniff.lines.splice(0, state.sniff.lines.length - SNIFF_MAX_LINES);
+  render();
+}
+
+function closeSniffer(msg = 'closed') {
+  const fd = state.sniff.fd;
+  state.sniff.fd = null;
+  state.sniff.active = false;
+  state.sniff.opening = false;
+  if (fd !== null && fd !== undefined) {
+    try { fs.closeSync(fd); } catch {}
+  }
+  if (state.sniff.path) sniffAddLine(`sniffer ${msg}: ${state.sniff.path}`);
+  state.status = `Sniffer ${msg}`;
+  render();
+}
+
+function sniffReadLoop() {
+  if (!state.sniff.active || state.sniff.fd === null || state.sniff.fd === undefined) return;
+  const buf = Buffer.alloc(SNIFF_READ_SIZE);
+  fs.read(state.sniff.fd, buf, 0, buf.length, null, (err, bytesRead) => {
+    if (!state.sniff.active) return;
+    if (err) {
+      const code = err.code || '';
+      if (code === 'EAGAIN' || code === 'EWOULDBLOCK') {
+        setTimeout(sniffReadLoop, 25);
+        return;
+      }
+      state.sniff.error = `${code || 'read error'} ${err.message || err}`;
+      sniffAddLine(`read error: ${state.sniff.error}`);
+      closeSniffer('stopped');
+      return;
+    }
+    if (bytesRead > 0) {
+      const chunk = buf.subarray(0, bytesRead);
+      state.sniff.bytes += bytesRead;
+      state.sniff.reads += 1;
+      sniffAddLine(`${rightPadRaw(bytesRead, 4)} bytes  ${hexDump(chunk)}`);
+    }
+    setTimeout(sniffReadLoop, bytesRead > 0 ? 0 : 25);
+  });
+}
+
+function selectedSniffTarget(d = selectedDevice()) {
+  const targets = sniffableNodesForDevice(d);
+  if (!targets.length) return null;
+  const idx = Math.max(0, Math.min(targets.length - 1, state.sniff.targetIndex || 0));
+  return targets[idx];
+}
+
+function cycleSniffTarget(delta) {
+  if (state.sniff.active || state.sniff.opening) return;
+  const targets = sniffableNodesForDevice(selectedDevice());
+  if (!targets.length) return;
+  state.sniff.targetIndex = (state.sniff.targetIndex + delta + targets.length) % targets.length;
+  render();
+}
+
+function toggleSniffer() {
+  if (state.sniff.active || state.sniff.opening) { closeSniffer('closed'); return; }
+  const target = selectedSniffTarget();
+  if (!target) {
+    state.status = 'No raw/input/hidraw node available to sniff on selected device';
+    render();
+    return;
+  }
+  state.sniff.opening = true;
+  state.sniff.path = target.path;
+  state.sniff.kind = target.kind || '';
+  state.sniff.error = '';
+  state.sniff.lines = [];
+  state.sniff.bytes = 0;
+  state.sniff.reads = 0;
+  render();
+  const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
+  fs.open(target.path, flags, (err, fd) => {
+    state.sniff.opening = false;
+    if (err) {
+      state.sniff.error = `${err.code || 'open error'} ${err.message || err}`;
+      sniffAddLine(`open failed: ${state.sniff.error}`);
+      state.status = `Sniffer open failed for ${target.path}`;
+      render();
+      return;
+    }
+    state.sniff.fd = fd;
+    state.sniff.active = true;
+    state.sniff.path = target.path;
+    state.sniff.kind = target.kind || '';
+    sniffAddLine(`opened ${target.path} (${state.sniff.kind || 'node'})`);
+    state.status = `Sniffing ${target.path}; press o to close`;
+    sniffReadLoop();
+  });
 }
 
 function rawUsbNodePath(bus, dev) {
@@ -1679,18 +1801,45 @@ function detailLines(d) {
     else lines.push(...relevant);
 
   } else if (state.tab === 5) {
-    lines.push(bold(`Raw USB descriptor excerpt: lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`), '');
-    lines.push('Press r to refresh. This tab loads on demand in the next version; current useful raw command:');
-    lines.push(`  lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`);
+    const targets = sniffableNodesForDevice(d);
+    if (state.sniff.targetIndex >= targets.length) state.sniff.targetIndex = Math.max(0, targets.length - 1);
+    const target = selectedSniffTarget(d);
+
+    lines.push(bold('Raw USB / device-node sniffer'), '');
+    lines.push('This is a first-pass byte viewer. Press o to open/close the selected node. Press [ or ] to choose a sniff target.');
+    lines.push('Raw /dev/bus/usb nodes are usbfs control endpoints, not a passive bus tap; many devices will show little or nothing on read.');
+    lines.push('Input event, mouse, and hidraw nodes are better first sniff targets because they stream kernel-decoded reports.');
     lines.push('');
     lines.push('Basic identity:');
     lines.push(`  Bus ${d.bus} Device ${d.dev}: ID ${d.vid}:${d.pid} ${d.name}`);
+    lines.push(`  Descriptor command: lsusb -v -s ${Number(d.bus)}:${Number(d.dev)}`);
     if (d.rawUsbNode || d.rawUsb) {
-      lines.push('');
-      lines.push('Raw USB node:');
-      lines.push(`  ${d.rawUsbNode || d.rawUsb}`);
+      lines.push(`  Raw USB node: ${d.rawUsbNode || d.rawUsb}`);
       if (d.rawUsbStat) lines.push(`  ${d.rawUsbStat}`);
     }
+    lines.push('');
+    lines.push(bold('Sniff targets'));
+    if (!targets.length) {
+      lines.push('  No raw/input/hidraw target available for this selected device.');
+    } else {
+      targets.forEach((t, idx) => {
+        const marker = target && t.path === target.path ? '>' : ' ';
+        const live = state.sniff.active && state.sniff.path === t.path ? '  OPEN' : '';
+        lines.push(`  ${marker} ${idx + 1}. ${t.path}  ${t.kind}${live}`);
+      });
+    }
+    lines.push('');
+    lines.push(bold('Sniffer status'));
+    lines.push(`  State: ${state.sniff.opening ? 'opening' : state.sniff.active ? 'open/read loop active' : 'closed'}`);
+    if (state.sniff.path) lines.push(`  Node: ${state.sniff.path}`);
+    if (state.sniff.kind) lines.push(`  Kind: ${state.sniff.kind}`);
+    lines.push(`  Reads: ${state.sniff.reads || 0}   Bytes: ${state.sniff.bytes || 0}`);
+    if (state.sniff.error) lines.push(`  Last error: ${state.sniff.error}`);
+    lines.push('');
+    lines.push(bold('Received bytes'));
+    const sniffLines = state.sniff.lines || [];
+    if (!sniffLines.length) lines.push('  No bytes yet. Open a node, then move/click/type/use the selected USB device.');
+    else for (const l of sniffLines.slice(-220)) lines.push(`  ${l}`);
   }
   return lines;
 }
@@ -1832,7 +1981,7 @@ function titleHelpLine() {
   const title = cyan(APP_TITLE);
   if (!state.showKeys) return `${title} —  press k for keyboard mappings`;
 
-  return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  r refresh  k hide keys  q quit`;
+  return `${title} —  Keys: ↑/↓ select USB device/hub  ←/→ tabs  PgUp/PgDn details  Ctrl+↑/↓ tree  1-6 tabs  o open/close sniffer  [/] target  r refresh  k hide keys  q quit`;
 }
 
 function render() {
@@ -1935,6 +2084,11 @@ let didCleanup = false;
 function cleanup() {
   if (didCleanup) return;
   didCleanup = true;
+  if (state.sniff && state.sniff.fd !== null && state.sniff.fd !== undefined) {
+    try { fs.closeSync(state.sniff.fd); } catch {}
+    state.sniff.fd = null;
+    state.sniff.active = false;
+  }
   leaveTuiScreen();
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
 }
@@ -1951,6 +2105,9 @@ function handleInput(buf) {
   if (s === '\u0003' || s === 'q') { cleanup(); process.exit(0); }
   if (s === 'r') { poll(true); return; }
   if (s === 'k' || s === 'K') { state.showKeys = !state.showKeys; render(); return; }
+  if (s === 'o' || s === 'O') { if (state.tab !== 5) state.tab = 5; toggleSniffer(); return; }
+  if (s === '[') { if (state.tab !== 5) state.tab = 5; cycleSniffTarget(-1); return; }
+  if (s === ']') { if (state.tab !== 5) state.tab = 5; cycleSniffTarget(1); return; }
   if (s === 'j' || s === '\x1b[B') { selectDelta(1); return; }
   if (s === '\x1b[A') { selectDelta(-1); return; }
   if (s === '\x1b[C') { setTab(state.tab + 1); return; }
