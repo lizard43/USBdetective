@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.15';
+const APP_VERSION = 'v20260608.17';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 // Heavy handle detection can walk /proc and run lsof/fuser.
@@ -41,10 +41,25 @@ const KEEP_REMOVED_MS = Number(process.env.USB_DETECTIVE_KEEP_REMOVED_MS || 4500
 const HIGHLIGHT_MS = Number(process.env.USB_DETECTIVE_HIGHLIGHT_MS || 5000);
 const USE_COLOR = process.env.USB_DETECTIVE_COLOR !== '0' && process.stdout.isTTY;
 
+const SUMMARY = 0;
+const RAW_USB = 1;
+const DEV = 2;
+const HANDLES = 3;
+const DRIVER = 4;
+const KERNEL = 5;
+const tabs = [
+  'Summary',
+  'Raw USB',
+  '/dev',
+  'Handles',
+  'Driver',
+  'Kernel'
+];
+
 const C = {
-  reset:'\x1b[0m', bold:'\x1b[1m', rev:'\x1b[7m',
-  red:'\x1b[31m', green:'\x1b[32m', yellow:'\x1b[33m', cyan:'\x1b[36m', white:'\x1b[37m',
-  bgBlue:'\x1b[44m', bgRed:'\x1b[41m', bgGreen:'\x1b[42m', black:'\x1b[30m'
+  reset: '\x1b[0m', bold: '\x1b[1m', rev: '\x1b[7m',
+  red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m', white: '\x1b[37m',
+  bgBlue: '\x1b[44m', bgRed: '\x1b[41m', bgGreen: '\x1b[42m', black: '\x1b[30m'
 };
 function color(code, s) { return USE_COLOR ? code + s + C.reset : s; }
 function bold(s) { return color(C.bold, s); }
@@ -115,7 +130,6 @@ let state = {
   leftRowMap: new Map(), lastPollAt: null,
   sniff: { fd: null, path: '', kind: '', active: false, opening: false, lines: [], bytes: 0, reads: 0, error: '', failPath: '', targetIndex: 0, viewMode: 'smart', partial: Buffer.alloc(0) }
 };
-const tabs = ['Summary', '/dev', 'Handles', 'Driver', 'Kernel', 'Raw USB'];
 
 const SNIFF_MAX_LINES = 500;
 const SNIFF_READ_SIZE = 64;
@@ -127,9 +141,10 @@ function sniffableNodesForDevice(d) {
   if (d.rawUsbNode || d.rawUsb) out.push({ path: d.rawUsbNode || d.rawUsb, kind: 'raw usbfs device' });
   for (const n of d.devNodes || []) {
     if (!n || !n.path) continue;
-    if (/^\/dev\/input\/(event\d+|mouse\d+|mice)$/.test(n.path)) out.push({ path: n.path, kind: devNodeShortLabel(n) || n.type || 'input node' });
-    else if (/^\/dev\/hidraw\d+$/.test(n.path)) out.push({ path: n.path, kind: 'hidraw node' });
-    else if (/^\/dev\/video\d+$/.test(n.path)) out.push({ path: n.path, kind: devNodeShortLabel(n) || 'video node' });
+    if (/^\/dev\/input\/(event\d+|mouse\d+|mice)$/.test(n.path)) out.push({ path: n.path, kind: devNodeShortLabel(n) || n.type || 'input node', node: n });
+    else if (/^\/dev\/hidraw\d+$/.test(n.path)) out.push({ path: n.path, kind: 'hidraw node', node: n });
+    else if (/^\/dev\/usb\/hiddev\d+$/.test(n.path)) out.push({ path: n.path, kind: 'hiddev node', node: n });
+    else if (/^\/dev\/video\d+$/.test(n.path)) out.push({ path: n.path, kind: devNodeShortLabel(n) || 'video node', node: n });
   }
   return out;
 }
@@ -151,16 +166,16 @@ const EV_TYPE_NAMES = {
   0: 'EV_SYN', 1: 'EV_KEY', 2: 'EV_REL', 3: 'EV_ABS', 4: 'EV_MSC', 17: 'EV_LED'
 };
 const EV_KEY_NAMES = {
-  1:'ESC', 2:'1', 3:'2', 4:'3', 5:'4', 6:'5', 7:'6', 8:'7', 9:'8', 10:'9', 11:'0',
-  12:'MINUS', 13:'EQUAL', 14:'BACKSPACE', 15:'TAB', 16:'Q', 17:'W', 18:'E', 19:'R', 20:'T', 21:'Y', 22:'U', 23:'I', 24:'O', 25:'P',
-  26:'LEFTBRACE', 27:'RIGHTBRACE', 28:'ENTER', 29:'LEFTCTRL', 30:'A', 31:'S', 32:'D', 33:'F', 34:'G', 35:'H', 36:'J', 37:'K', 38:'L',
-  39:'SEMICOLON', 40:'APOSTROPHE', 41:'GRAVE', 42:'LEFTSHIFT', 43:'BACKSLASH', 44:'Z', 45:'X', 46:'C', 47:'V', 48:'B', 49:'N', 50:'M',
-  51:'COMMA', 52:'DOT', 53:'SLASH', 54:'RIGHTSHIFT', 56:'LEFTALT', 57:'SPACE', 58:'CAPSLOCK',
-  97:'RIGHTCTRL', 100:'RIGHTALT', 103:'UP', 105:'LEFT', 106:'RIGHT', 108:'DOWN', 110:'INSERT', 111:'DELETE',
-  272:'BTN_LEFT', 273:'BTN_RIGHT', 274:'BTN_MIDDLE', 275:'BTN_SIDE', 276:'BTN_EXTRA'
+  1: 'ESC', 2: '1', 3: '2', 4: '3', 5: '4', 6: '5', 7: '6', 8: '7', 9: '8', 10: '9', 11: '0',
+  12: 'MINUS', 13: 'EQUAL', 14: 'BACKSPACE', 15: 'TAB', 16: 'Q', 17: 'W', 18: 'E', 19: 'R', 20: 'T', 21: 'Y', 22: 'U', 23: 'I', 24: 'O', 25: 'P',
+  26: 'LEFTBRACE', 27: 'RIGHTBRACE', 28: 'ENTER', 29: 'LEFTCTRL', 30: 'A', 31: 'S', 32: 'D', 33: 'F', 34: 'G', 35: 'H', 36: 'J', 37: 'K', 38: 'L',
+  39: 'SEMICOLON', 40: 'APOSTROPHE', 41: 'GRAVE', 42: 'LEFTSHIFT', 43: 'BACKSLASH', 44: 'Z', 45: 'X', 46: 'C', 47: 'V', 48: 'B', 49: 'N', 50: 'M',
+  51: 'COMMA', 52: 'DOT', 53: 'SLASH', 54: 'RIGHTSHIFT', 56: 'LEFTALT', 57: 'SPACE', 58: 'CAPSLOCK',
+  97: 'RIGHTCTRL', 100: 'RIGHTALT', 103: 'UP', 105: 'LEFT', 106: 'RIGHT', 108: 'DOWN', 110: 'INSERT', 111: 'DELETE',
+  272: 'BTN_LEFT', 273: 'BTN_RIGHT', 274: 'BTN_MIDDLE', 275: 'BTN_SIDE', 276: 'BTN_EXTRA'
 };
-const EV_REL_NAMES = { 0:'REL_X', 1:'REL_Y', 6:'REL_HWHEEL', 8:'REL_WHEEL' };
-const EV_ABS_NAMES = { 0:'ABS_X', 1:'ABS_Y', 2:'ABS_Z', 3:'ABS_RX', 4:'ABS_RY', 5:'ABS_RZ', 16:'ABS_HAT0X', 17:'ABS_HAT0Y' };
+const EV_REL_NAMES = { 0: 'REL_X', 1: 'REL_Y', 6: 'REL_HWHEEL', 8: 'REL_WHEEL' };
+const EV_ABS_NAMES = { 0: 'ABS_X', 1: 'ABS_Y', 2: 'ABS_Z', 3: 'ABS_RX', 4: 'ABS_RY', 5: 'ABS_RZ', 16: 'ABS_HAT0X', 17: 'ABS_HAT0Y' };
 
 function inputEventCodeName(type, code) {
   if (type === 1) return EV_KEY_NAMES[code] || `KEY_${code}`;
@@ -255,7 +270,7 @@ function closeSniffer(msg = 'closed') {
   state.sniff.active = false;
   state.sniff.opening = false;
   if (fd !== null && fd !== undefined) {
-    try { fs.closeSync(fd); } catch {}
+    try { fs.closeSync(fd); } catch { }
   }
   if (state.sniff.path) sniffAddLine(`sniffer ${msg}: ${state.sniff.path}`);
   state.status = `Sniffer ${msg}`;
@@ -354,7 +369,7 @@ function rawUsbNodeSummary(d) {
 async function getLsusbDevices() {
   const r = await run('lsusb', [], { timeout: 3000 });
   return (r.stdout || '').split('\n').map(parseLsusbLine).filter(Boolean)
-    .sort((a,b) => a.bus.localeCompare(b.bus) || Number(a.dev) - Number(b.dev));
+    .sort((a, b) => a.bus.localeCompare(b.bus) || Number(a.dev) - Number(b.dev));
 }
 async function getLsusbTree() {
   const r = await run('lsusb', ['-t'], { timeout: 3000, maxBuffer: 1024 * 1024 });
@@ -365,7 +380,7 @@ async function getDmesgTail() {
   return (r.stdout || '').split('\n').filter(l => /usb|ttyUSB|ttyACM|cdc_acm|ch341|ch34|ftdi|cp210|pl2303|hid|input|video|uvc|storage|scsi|sd[a-z]|disconnect/i.test(l)).slice(-60);
 }
 async function getDevCandidates() {
-  const cmd = `for p in /dev/ttyUSB* /dev/ttyACM* /dev/video* /dev/hidraw* /dev/sd* /dev/nvme* /dev/input/event* /dev/input/mouse* /dev/input/mice; do [ -e "$p" ] && echo "$p"; done | sort -V`;
+  const cmd = `for p in /dev/ttyUSB* /dev/ttyACM* /dev/video* /dev/media* /dev/hidraw* /dev/usb/hiddev* /dev/sd* /dev/nvme* /dev/input/event* /dev/input/mouse* /dev/input/mice; do [ -e "$p" ] && echo "$p"; done | sort -V`;
   const r = await sh(cmd, { timeout: 3000, maxBuffer: 1024 * 1024 });
   return (r.stdout || '').split('\n').map(s => s.trim()).filter(Boolean);
 }
@@ -380,7 +395,7 @@ async function udevProps(devPath) {
 }
 async function symlinkMatches(devPath) {
   const real = await fs.promises.realpath(devPath).catch(() => devPath);
-  const dirs = ['/dev/serial/by-id','/dev/serial/by-path','/dev/disk/by-id','/dev/disk/by-label','/dev/disk/by-uuid','/dev/v4l/by-id','/dev/v4l/by-path','/dev/input/by-id','/dev/input/by-path'];
+  const dirs = ['/dev/serial/by-id', '/dev/serial/by-path', '/dev/disk/by-id', '/dev/disk/by-label', '/dev/disk/by-uuid', '/dev/v4l/by-id', '/dev/v4l/by-path', '/dev/input/by-id', '/dev/input/by-path'];
   const out = [];
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) continue;
@@ -391,7 +406,7 @@ async function symlinkMatches(devPath) {
       try {
         const target = await fs.promises.realpath(link);
         if (target === real) out.push(`${link} -> ${await fs.promises.readlink(link)}`);
-      } catch {}
+      } catch { }
     }
   }
   return out.sort();
@@ -493,7 +508,7 @@ async function scanLikelyInputConsumers() {
     try {
       const info = await procInfo(pid);
       if (looksLikeInputConsumer(info)) out.push({ ...info, fds: [], source: 'input-stack guess' });
-    } catch {}
+    } catch { }
   }
 
   return out.sort((a, b) => Number(a.pid) - Number(b.pid));
@@ -502,7 +517,7 @@ async function scanLikelyInputConsumers() {
 async function scanProcOpeners(devPath) {
   const out = [];
   let devReal = devPath;
-  try { devReal = await fs.promises.realpath(devPath); } catch {}
+  try { devReal = await fs.promises.realpath(devPath); } catch { }
   const targetIdentity = await devNodeIdentity(devPath);
   let pids = [];
   try {
@@ -523,7 +538,7 @@ async function scanProcOpeners(devPath) {
         const link = await fs.promises.readlink(fdPath);
         let resolved = link;
         if (link.startsWith('/dev/')) {
-          try { resolved = await fs.promises.realpath(link); } catch {}
+          try { resolved = await fs.promises.realpath(link); } catch { }
         }
 
         let reason = '';
@@ -535,11 +550,11 @@ async function scanProcOpeners(devPath) {
             if (Number(fst.rdev || 0) === Number(targetIdentity.rdev || 0)) {
               reason = `major/minor ${targetIdentity.major}:${targetIdentity.minor}`;
             }
-          } catch {}
+          } catch { }
         }
 
         if (reason) matchedFds.push({ fd, target: link, match: reason });
-      } catch {}
+      } catch { }
     }
 
     if (matchedFds.length) {
@@ -612,7 +627,7 @@ async function getHandleUsers(devPath) {
   const [lsof, procfs, fuser, likelyInputConsumers] = await Promise.all([
     lsofOpeners(devPath).catch(() => []),
     scanProcOpeners(devPath).catch(() => []),
-    fuserOpeners(devPath).catch(() => ({ ok:false, stdout:'', stderr:'', available:false })),
+    fuserOpeners(devPath).catch(() => ({ ok: false, stdout: '', stderr: '', available: false })),
     isInputNode ? scanLikelyInputConsumers().catch(() => []) : Promise.resolve([])
   ]);
 
@@ -651,7 +666,7 @@ async function getHandleUsers(devPath) {
 }
 
 async function getLsblkJson() {
-  const r = await run('lsblk', ['-J','-o','NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,MODEL,SERIAL,TRAN,RM,MOUNTPOINTS'], { timeout: 3000, maxBuffer: 2 * 1024 * 1024 });
+  const r = await run('lsblk', ['-J', '-o', 'NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,MODEL,SERIAL,TRAN,RM,MOUNTPOINTS'], { timeout: 3000, maxBuffer: 2 * 1024 * 1024 });
   try { return JSON.parse(r.stdout || '{}'); } catch { return {}; }
 }
 function flattenBlock(tree, arr = []) {
@@ -662,7 +677,7 @@ function walkBlock(d, arr) { arr.push(d); for (const c of d.children || []) walk
 function busDevFromProps(props) {
   let bus = props.BUSNUM || props.ID_BUSNUM || '';
   let dev = props.DEVNUM || props.ID_DEVNUM || '';
-  if (bus && dev) return `${String(bus).padStart(3,'0')}:${String(dev).padStart(3,'0')}`;
+  if (bus && dev) return `${String(bus).padStart(3, '0')}:${String(dev).padStart(3, '0')}`;
   return '';
 }
 function vidPidFromProps(props) {
@@ -675,7 +690,9 @@ function classifyDevNode(devPath, props) {
   if (/^ttyUSB\d+$/.test(base)) return 'USB serial adapter';
   if (/^ttyACM\d+$/.test(base)) return 'CDC/ACM serial device';
   if (/^video\d+$/.test(base)) return 'Video/camera node';
+  if (/^media\d+$/.test(base)) return 'V4L2 media-controller node';
   if (/^hidraw\d+$/.test(base)) return 'HID raw node';
+  if (/^hiddev\d+$/.test(base) || /^\/dev\/usb\/hiddev\d+$/.test(devPath)) return 'USB HID device node';
   if (/^mouse\d+$/.test(base) || base === 'mice') return 'Input mouse aggregate node';
   if (/^event\d+$/.test(base)) {
     const kind = inputKindFromProps(props);
@@ -751,12 +768,12 @@ async function inputSysfsInfo(devPath, props) {
       const uniq = (await fs.promises.readFile(`${dir}/uniq`, 'utf8').catch(() => '')).trim();
       const capsDir = `${dir}/capabilities`;
       const caps = {};
-      for (const cap of ['ev','key','rel','abs','msc','led','sw']) {
+      for (const cap of ['ev', 'key', 'rel', 'abs', 'msc', 'led', 'sw']) {
         const v = (await fs.promises.readFile(`${capsDir}/${cap}`, 'utf8').catch(() => '')).trim();
         if (v) caps[cap] = v;
       }
       return { name, phys, uniq, caps, kind: inferInputKindFromSysfs({ name }) };
-    } catch {}
+    } catch { }
   }
 
   return null;
@@ -775,7 +792,7 @@ async function videoNodeInfo(devPath, props) {
     if (v) { info.name = v; break; }
   }
 
-  const r = await run('v4l2-ctl', ['--device', devPath, '--info'], { timeout: 1800, maxBuffer: 256 * 1024 }).catch(() => ({ ok:false, stdout:'' }));
+  const r = await run('v4l2-ctl', ['--device', devPath, '--info'], { timeout: 1800, maxBuffer: 256 * 1024 }).catch(() => ({ ok: false, stdout: '' }));
   if (r && r.ok && r.stdout) {
     for (const line of r.stdout.split('\n')) {
       let m = line.match(/^\s*Driver name\s*:\s*(.*)$/); if (m) info.driver = m[1].trim();
@@ -789,7 +806,7 @@ async function videoNodeInfo(devPath, props) {
     }
   }
 
-  const fr = await run('v4l2-ctl', ['--device', devPath, '--list-formats-ext'], { timeout: 2200, maxBuffer: 512 * 1024 }).catch(() => ({ ok:false, stdout:'' }));
+  const fr = await run('v4l2-ctl', ['--device', devPath, '--list-formats-ext'], { timeout: 2200, maxBuffer: 512 * 1024 }).catch(() => ({ ok: false, stdout: '' }));
   if (fr && fr.ok && fr.stdout) {
     for (const line of fr.stdout.split('\n')) {
       const m = line.match(/\[\d+\]:\s+'([^']+)'\s+\((.+)\)/);
@@ -806,10 +823,23 @@ async function videoNodeInfo(devPath, props) {
   return (info.name || info.driver || info.card || info.formats.length || info.role) ? info : null;
 }
 
+async function mediaNodeInfo(devPath, props) {
+  if (!/^media\d+$/.test(path.basename(devPath))) return null;
+  const info = { model: '', driver: '', card: '', bus: '' };
+  const base = path.basename(devPath);
+  const sysDir = `/sys/class/media/${base}/device`;
+  info.model = (await fs.promises.readFile(`${sysDir}/model`, 'utf8').catch(() => '')).trim();
+  info.driver = (props && (props.ID_USB_DRIVER || props.DRIVER)) || '';
+  info.card = info.model || (props && (props.ID_MODEL_FROM_DATABASE || props.ID_MODEL)) || '';
+  info.bus = props && props.ID_PATH ? props.ID_PATH : '';
+  return (info.model || info.driver || info.card || info.bus) ? info : { card: 'V4L2 media controller' };
+}
+
 async function decorateDevNode(record) {
   record.devIdentity = await devNodeIdentity(record.path).catch(() => null);
   record.input = await inputSysfsInfo(record.path, record.props).catch(() => null);
   record.video = await videoNodeInfo(record.path, record.props).catch(() => null);
+  record.media = await mediaNodeInfo(record.path, record.props).catch(() => null);
   return record;
 }
 
@@ -947,7 +977,7 @@ async function enrichDevice(dev, allNodes, blockMap, kernelClues) {
     const props = await udevProps(node);
     const bd = busDevFromProps(props);
     const vp = vidPidFromProps(props);
-    if (bd === dev.key || (!bd && vp === `${dev.vid}:${dev.pid}`) || (vp === `${dev.vid}:${dev.pid}` && path.basename(node).match(/^(ttyUSB|ttyACM|video|hidraw|event|sd|nvme)/))) {
+    if (bd === dev.key || (!bd && vp === `${dev.vid}:${dev.pid}`) || (vp === `${dev.vid}:${dev.pid}` && path.basename(node).match(/^(ttyUSB|ttyACM|video|media|hidraw|hiddev|event|mouse|sd|nvme)/))) {
       matches.push(await decorateDevNode({ path: node, props, type: classifyDevNode(node, props), iface: interfaceLabel(props), links: await symlinkMatches(node), stat: await lsLong(node), users: await getHandleUsers(node), usbPath: usbPathFromProps(props), kernel: kernelClues && kernelClues.byDevNode ? kernelClues.byDevNode.get(node) : null }));
     }
   }
@@ -1043,7 +1073,7 @@ function updateHighlights(newDevices) {
 function mergedDevices(devices) {
   const out = [...devices];
   for (const [k, d] of state.removedDevices) if (!devices.some(x => x.key === k)) out.push(d);
-  return out.sort((a,b) => a.bus.localeCompare(b.bus) || Number(a.dev) - Number(b.dev));
+  return out.sort((a, b) => a.bus.localeCompare(b.bus) || Number(a.dev) - Number(b.dev));
 }
 function signature(snap) {
   pruneHighlights();
@@ -1208,6 +1238,7 @@ function devNodeShortLabel(n) {
   if (serialLabel) return serialLabel;
 
   if (n.video) return videoShortLabel(n);
+  if (n.media) return mediaShortLabel(n);
 
   const kernelLabel = devNodeKernelLabel(n);
   if (kernelLabel) return kernelLabel;
@@ -1221,6 +1252,8 @@ function devNodeShortLabel(n) {
   }
 
   if (/^hidraw\d+$/.test(path.basename(n.path))) return 'Raw HID';
+  if (/^hiddev\d+$/.test(path.basename(n.path)) || /^\/dev\/usb\/hiddev\d+$/.test(n.path)) return 'USB HID device';
+  if (/^media\d+$/.test(path.basename(n.path))) return 'V4L2 media controller';
   if (/^video\d+$/.test(path.basename(n.path))) return 'Video node';
   return '';
 }
@@ -1229,26 +1262,30 @@ function leftDevNodeLabel(d, devPath) {
   const n = (d.devNodes || []).find(x => x.path === devPath);
   if (!n) return devPath;
   const label = devNodeShortLabel(n);
-  return label ? `${devPath}  ${label}` : devPath;
+  {
+    const stable = bestStableName(n);
+    const base = label ? `${devPath}  ${label}` : devPath;
+    return stable ? `${base}  → ${stable}` : base;
+  }
 }
 
 function buildFallbackRows() {
   const rows = [];
   const buses = [...new Set(state.devices.map(d => d.bus))].sort();
   for (const bus of buses) {
-    rows.push({ type:'bus', key:`bus:${bus}`, text:`USB Bus ${bus}`, selectable:false });
-    const list = state.devices.filter(d => d.bus === bus).sort((a,b) => Number(a.dev) - Number(b.dev));
+    rows.push({ type: 'bus', key: `bus:${bus}`, text: `USB Bus ${bus}`, selectable: false });
+    const list = state.devices.filter(d => d.bus === bus).sort((a, b) => Number(a.dev) - Number(b.dev));
     list.forEach((d, i) => {
       const isLastDevice = i === list.length - 1;
       const branch = isLastDevice ? '└─' : '├─';
       const childPrefix = isLastDevice ? '   ' : '│  ';
       rows.push({
-        type:'dev',
-        key:d.key,
-        selectKey:d.key,
-        device:d,
-        text:`${branch} ${d.name || '(unnamed USB device)'}`,
-        selectable:true
+        type: 'dev',
+        key: d.key,
+        selectKey: d.key,
+        device: d,
+        text: `${branch} ${d.name || '(unnamed USB device)'}`,
+        selectable: true
       });
       const nodes = (d.devNodes || []).map(n => n.path).sort();
       const metaPrefix = childPrefix + (nodes.length ? '│  ' : '   ');
@@ -1257,22 +1294,22 @@ function buildFallbackRows() {
       if (rawFallback) fallbackInfo.push(rawFallback);
       if (d.kernel && d.kernel.roles && d.kernel.roles.length) fallbackInfo.push(`Functions ${d.kernel.roles.join('/')}`);
       fallbackInfo.forEach((line, idx) => rows.push({
-        type:'meta',
-        key:`${d.key}:meta${idx || ''}`,
-        selectKey:d.key,
-        parentKey:d.key,
-        device:d,
-        text:`${metaPrefix}${line}`,
-        selectable:false
+        type: 'meta',
+        key: `${d.key}:meta${idx || ''}`,
+        selectKey: d.key,
+        parentKey: d.key,
+        device: d,
+        text: `${metaPrefix}${line}`,
+        selectable: false
       }));
       nodes.forEach((n, j) => rows.push({
-        type:'node',
-        key:`${d.key}:${n}`,
-        selectKey:d.key,
-        parentKey:d.key,
-        device:d,
-        text:`${childPrefix}${j === nodes.length - 1 ? '└─' : '├─'} ${leftDevNodeLabel(d, n)}`,
-        selectable:false
+        type: 'node',
+        key: `${d.key}:${n}`,
+        selectKey: d.key,
+        parentKey: d.key,
+        device: d,
+        text: `${childPrefix}${j === nodes.length - 1 ? '└─' : '├─'} ${leftDevNodeLabel(d, n)}`,
+        selectable: false
       }));
     });
   }
@@ -1406,13 +1443,13 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
   const name = d.name || t.className || '(unnamed USB device)';
   const text = `${prefix}${branch} ${name}`;
   rows.push({
-    type:'dev',
-    key:t.key,
-    selectKey:t.key,
-    device:d,
-    topo:t,
+    type: 'dev',
+    key: t.key,
+    selectKey: t.key,
+    device: d,
+    topo: t,
     text,
-    selectable:true
+    selectable: true
   });
 
   const childPrefix = prefix + (isLast ? '   ' : '│  ');
@@ -1426,14 +1463,14 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
   const metaPrefix = childPrefix + (hasChildRows ? '│  ' : '   ');
   const infoLines = deviceInfoLines(t, d).filter(Boolean);
   infoLines.forEach((line, idx) => rows.push({
-    type:'meta',
-    key:`${t.key}:meta${idx || ''}`,
-    selectKey:t.key,
-    parentKey:t.key,
-    device:d,
-    topo:t,
-    text:`${metaPrefix}${line}`,
-    selectable:false
+    type: 'meta',
+    key: `${t.key}:meta${idx || ''}`,
+    selectKey: t.key,
+    parentKey: t.key,
+    device: d,
+    topo: t,
+    text: `${metaPrefix}${line}`,
+    selectable: false
   }));
 
   children.forEach((c, i) => {
@@ -1444,13 +1481,13 @@ function addTopoNodeRows(rows, t, prefix, isLast) {
   nodes.forEach((n, j) => {
     const nodeIsLast = j === nodes.length - 1;
     rows.push({
-      type:'node',
-      key:`${t.key}:${n}`,
-      selectKey:t.key,
-      parentKey:t.key,
-      device:d,
-      text:`${childPrefix}${nodeIsLast ? '└─' : '├─'} ${leftDevNodeLabel(d, n)}`,
-      selectable:false
+      type: 'node',
+      key: `${t.key}:${n}`,
+      selectKey: t.key,
+      parentKey: t.key,
+      device: d,
+      text: `${childPrefix}${nodeIsLast ? '└─' : '├─'} ${leftDevNodeLabel(d, n)}`,
+      selectable: false
     });
   });
 }
@@ -1478,12 +1515,12 @@ function addNewsDeviceRows(rows, d, reason, isLast) {
   const branch = isLast ? '└─' : '├─';
   const childPrefix = isLast ? '   ' : '│  ';
   rows.push({
-    type:'dev',
-    key:d.key,
-    selectKey:d.key,
-    device:d,
-    text:`${branch} ${reason}: ${d.name || '(unnamed USB device)'}`,
-    selectable:true
+    type: 'dev',
+    key: d.key,
+    selectKey: d.key,
+    device: d,
+    text: `${branch} ${reason}: ${d.name || '(unnamed USB device)'}`,
+    selectable: true
   });
 
   const nodes = (d.devNodes || []).map(n => n.path).sort();
@@ -1497,23 +1534,23 @@ function addNewsDeviceRows(rows, d, reason, isLast) {
   if (d.removed) lines.push('Device is no longer active; retained briefly for visibility.');
 
   lines.forEach((line, idx) => rows.push({
-    type:'meta',
-    key:`news:${d.key}:meta${idx || ''}`,
-    selectKey:d.key,
-    parentKey:d.key,
-    device:d,
-    text:`${metaPrefix}${line}`,
-    selectable:false
+    type: 'meta',
+    key: `news:${d.key}:meta${idx || ''}`,
+    selectKey: d.key,
+    parentKey: d.key,
+    device: d,
+    text: `${metaPrefix}${line}`,
+    selectable: false
   }));
 
   nodes.forEach((n, j) => rows.push({
-    type:'node',
-    key:`news:${d.key}:${n}`,
-    selectKey:d.key,
-    parentKey:d.key,
-    device:d,
-    text:`${childPrefix}${j === nodes.length - 1 ? '└─' : '├─'} ${leftDevNodeLabel(d, n)}`,
-    selectable:false
+    type: 'node',
+    key: `news:${d.key}:${n}`,
+    selectKey: d.key,
+    parentKey: d.key,
+    device: d,
+    text: `${childPrefix}${j === nodes.length - 1 ? '└─' : '├─'} ${leftDevNodeLabel(d, n)}`,
+    selectable: false
   }));
 }
 
@@ -1537,7 +1574,7 @@ function addTopNewsRows(rows, topoKeys) {
 
   if (!news.length) return;
 
-  rows.push({ type:'bus', key:'news:top', text:'USB changes / topology pending', selectable:false });
+  rows.push({ type: 'bus', key: 'news:top', text: 'USB changes / topology pending', selectable: false });
   news.forEach((item, i) => addNewsDeviceRows(rows, item.d, item.reason, i === news.length - 1));
 }
 
@@ -1559,8 +1596,8 @@ function buildRows() {
   }
 
   for (const bus of [...byBus.keys()].sort()) {
-    rows.push({ type:'bus', key:`bus:${bus}`, text:`USB Bus ${bus}`, selectable:false });
-    const busRoots = byBus.get(bus).sort((a,b) => Number(a.dev) - Number(b.dev));
+    rows.push({ type: 'bus', key: `bus:${bus}`, text: `USB Bus ${bus}`, selectable: false });
+    const busRoots = byBus.get(bus).sort((a, b) => Number(a.dev) - Number(b.dev));
     busRoots.forEach((r, i) => addTopoNodeRows(rows, r, '', i === busRoots.length - 1));
   }
 
@@ -1663,12 +1700,9 @@ function handleDetailLines(d) {
       if (vb) lines.push(`  Video: ${vb}`);
     }
 
-    const best = n.links.find(l => l.startsWith('/dev/serial/by-id/')) ||
-      n.links.find(l => l.startsWith('/dev/v4l/by-id/')) ||
-      n.links.find(l => l.startsWith('/dev/disk/by-id/')) ||
-      n.links[0];
+    const stable = bestStableName(n);
 
-    if (best) lines.push(`  Stable name: ${best.split(' -> ')[0]}`);
+    if (stable) lines.push(`  Stable name: ${stable}`);
 
     const users = n.users || {};
     const procs = users.processes || [];
@@ -1767,9 +1801,9 @@ function driverDetailLines(d) {
   lines.push('');
 
   const keyGroups = [
-    ['Core', ['SUBSYSTEM','DEVTYPE','ID_BUS','ID_USB_DRIVER','DRIVER','ID_USB_INTERFACE_NUM']],
-    ['Identity', ['ID_VENDOR','ID_VENDOR_FROM_DATABASE','ID_VENDOR_ID','ID_MODEL','ID_MODEL_FROM_DATABASE','ID_MODEL_ID','ID_SERIAL','ID_SERIAL_SHORT']],
-    ['Path', ['ID_PATH','DEVPATH','TAGS']]
+    ['Core', ['SUBSYSTEM', 'DEVTYPE', 'ID_BUS', 'ID_USB_DRIVER', 'DRIVER', 'ID_USB_INTERFACE_NUM']],
+    ['Identity', ['ID_VENDOR', 'ID_VENDOR_FROM_DATABASE', 'ID_VENDOR_ID', 'ID_MODEL', 'ID_MODEL_FROM_DATABASE', 'ID_MODEL_ID', 'ID_SERIAL', 'ID_SERIAL_SHORT']],
+    ['Path', ['ID_PATH', 'DEVPATH', 'TAGS']]
   ];
 
   activeNodes.forEach((n, idx) => {
@@ -1810,6 +1844,55 @@ function driverDetailLines(d) {
 }
 
 
+
+function statBitsFromLong(statLine) {
+  const m = String(statLine || '').match(/^([bcpsl-][rwxSTst-]{9})\+?\s+\d+\s+(\S+)\s+(\S+)\s+/);
+  if (!m) return { mode: '', owner: '', group: '' };
+  return { mode: m[1], owner: m[2], group: m[3] };
+}
+
+function nodePermSummary(n) {
+  if (!n) return '';
+  const st = statBitsFromLong(n.stat || '');
+  if (!st.mode) return '';
+  return `${st.mode} ${st.owner}:${st.group}`;
+}
+
+function sniffTargetPermText(t) {
+  const n = t && t.node;
+  const p = n ? nodePermSummary(n) : '';
+  if (!p) return '';
+  const group = statBitsFromLong(n.stat || '').group;
+  const hints = [];
+  if (/^\/dev\/input\//.test(t.path || '') && group === 'input') hints.push('input group/root');
+  else if (/^\/dev\/video\d+$/.test(t.path || '') && group === 'video') hints.push('video group/root');
+  else if (/^\/dev\/media\d+$/.test(t.path || '') && group === 'video') hints.push('video group/root');
+  else if (/^\/dev\/hidraw\d+$/.test(t.path || '') || /^\/dev\/usb\/hiddev\d+$/.test(t.path || '')) hints.push('usually root/udev rule');
+  return hints.length ? `${p} (${hints.join(', ')})` : p;
+}
+
+function stableLinksForNode(n, preferredOnly = false) {
+  const links = (n && n.links) || [];
+  const preferred = links.filter(l =>
+    l.startsWith('/dev/input/by-id/') ||
+    l.startsWith('/dev/v4l/by-id/') ||
+    l.startsWith('/dev/serial/by-id/') ||
+    l.startsWith('/dev/disk/by-id/')
+  );
+  return preferredOnly ? preferred : (preferred.length ? preferred : links);
+}
+
+function bestStableName(n) {
+  const best = stableLinksForNode(n, false)[0];
+  return best ? best.split(' -> ')[0] : '';
+}
+
+function mediaShortLabel(n) {
+  if (!n || !n.media) return '';
+  const card = n.media.card || n.media.model || n.media.driver || 'V4L2 media controller';
+  return `${card} media/controller`;
+}
+
 function sniffTargetStatusText(t) {
   if (!t || !t.path) return '';
   if (state.sniff.active && state.sniff.path === t.path) return green('OPEN');
@@ -1828,7 +1911,7 @@ function detailLines(d) {
   const activeNodes = d.devNodes || [];
   const header = `${d.key}  ${d.vid}:${d.pid}  ${d.name || '(unnamed)'}`;
 
-  if (state.tab === 0) {
+  if (state.tab === SUMMARY) {
     lines.push(bold(header), '');
     lines.push(`Status: ${d.removed ? red('recently unplugged') : 'active'}`);
     lines.push(`Bus: ${d.bus}`);
@@ -1849,12 +1932,12 @@ function detailLines(d) {
     }
     lines.push('');
     lines.push(bold('Detected /dev handles'));
-    if (activeNodes.length) for (const n of activeNodes) lines.push(`  ${n.path}  ${n.iface ? '(' + n.iface + ')' : ''}  ${friendlyDevNodeType(n)}`);
+    if (activeNodes.length) for (const n of activeNodes) lines.push(`  ${n.path}  ${n.iface ? '(' + n.iface + ')' : ''}  ${friendlyDevNodeType(n)}${bestStableName(n) ? '  → ' + bestStableName(n) : ''}`);
     else lines.push('  None found. Root hubs and some internal devices may not create user-facing /dev nodes.');
     lines.push('');
     lines.push(...suggestions(d));
 
-  } else if (state.tab === 1) {
+  } else if (state.tab === DEV) {
     lines.push(bold('/dev nodes and stable names'), '');
     if (d.rawUsbNode || d.rawUsb) {
       lines.push(bold('Raw USB device node'));
@@ -1884,27 +1967,36 @@ function detailLines(d) {
         if (n.video.bus) lines.push(`  Video bus: ${n.video.bus}`);
         if (n.video.formats && n.video.formats.length) lines.push(`  Video formats: ${n.video.formats.join(', ')}`);
       }
+      if (n.media) {
+        lines.push('  Media role: V4L2 media-controller topology node');
+        if (n.media.card) lines.push(`  Media card: ${n.media.card}`);
+        if (n.media.driver) lines.push(`  Media driver: ${n.media.driver}`);
+        if (n.media.bus) lines.push(`  Media bus: ${n.media.bus}`);
+      }
       if (n.stat) lines.push(`  Node: ${n.stat}`);
-      const best = n.links.find(l => l.startsWith('/dev/serial/by-id/')) ||
-        n.links.find(l => l.startsWith('/dev/v4l/by-id/')) ||
-        n.links.find(l => l.startsWith('/dev/disk/by-id/')) ||
-        n.links[0];
-      if (best) lines.push(`  Best stable name: ${best.split(' -> ')[0]}`);
-      if (n.links.length) {
-        lines.push('  Symlinks:');
-        for (const l of n.links) lines.push(`    ${l}`);
+      const stable = bestStableName(n);
+      if (stable) lines.push(`  Best stable name: ${stable}`);
+      const preferredLinks = stableLinksForNode(n, true);
+      if (preferredLinks.length) {
+        lines.push('  Preferred stable symlinks:');
+        for (const l of preferredLinks) lines.push(`    ${l}`);
+      }
+      const otherLinks = (n.links || []).filter(l => !preferredLinks.includes(l));
+      if (otherLinks.length) {
+        lines.push('  Other symlinks:');
+        for (const l of otherLinks) lines.push(`    ${l}`);
       }
       if (n.block) lines.push(`  Block: ${n.block.type || ''} ${n.block.size || ''} ${n.block.fstype || ''} ${n.block.label || ''} ${(n.block.mountpoints || []).filter(Boolean).join(',')}`);
       lines.push('');
     }
 
-  } else if (state.tab === 2) {
+  } else if (state.tab === HANDLES) {
     lines.push(...handleDetailLines(d));
 
-  } else if (state.tab === 3) {
+  } else if (state.tab === DRIVER) {
     lines.push(...driverDetailLines(d));
 
-  } else if (state.tab === 4) {
+  } else if (state.tab === KERNEL) {
     lines.push(bold('Recent relevant kernel clues'), '');
     let relevant = d.kernel && d.kernel.lines && d.kernel.lines.length ? d.kernel.lines.slice(-60) : [];
     if (!relevant.length) {
@@ -1913,13 +2005,12 @@ function detailLines(d) {
     if (!relevant.length) lines.push('No recent matching kernel lines in dmesg tail.');
     else lines.push(...relevant);
 
-  } else if (state.tab === 5) {
+  } else if (state.tab === RAW_USB) {
     const targets = sniffableNodesForDevice(d);
     if (state.sniff.targetIndex >= targets.length) state.sniff.targetIndex = Math.max(0, targets.length - 1);
     const target = selectedSniffTarget(d);
 
     lines.push(bold('Raw USB / device-node sniffer'), '');
-    lines.push('This is a first-pass byte viewer. Press o to open/close the selected node. Press [ or ] to choose a sniff target.');
     lines.push('Raw /dev/bus/usb nodes are usbfs control endpoints, not a passive bus tap; many devices will show little or nothing on read.');
     lines.push('Input event, mouse, hidraw, and video nodes can be selected as sniff targets. Video nodes may require a real capture app/ioctl sequence before data appears.');
     lines.push('');
@@ -1939,7 +2030,9 @@ function detailLines(d) {
         const marker = target && t.path === target.path ? '>' : ' ';
         const status = sniffTargetStatusText(t);
         const statusText = status ? `  ${status}` : '';
-        lines.push(`  ${marker} ${idx + 1}. ${t.path}  ${t.kind}${statusText}`);
+        const perm = sniffTargetPermText(t);
+        const permText = perm ? `  ${dim(perm)}` : '';
+        lines.push(`  ${marker} ${idx + 1}. ${t.path}  ${t.kind}${statusText}${permText}`);
       });
     }
     lines.push('');
@@ -1969,7 +2062,7 @@ function suggestions(d) {
     lines.push('  Camera/capture device: install v4l-utils, then inspect formats with v4l2-ctl --list-formats-ext.');
   } else if (nodes.some(n => /sd[a-z]|nvme/.test(n.path))) {
     lines.push('  Storage device: inspect filesystem/mount with lsblk -f.');
-  } else if (nodes.some(n => /event\d+$/.test(n.path) || /hidraw\d+$/.test(n.path))) {
+  } else if (nodes.some(n => /event\d+$/.test(n.path) || /hidraw\d+$/.test(n.path) || /hiddev\d+$/.test(n.path))) {
     lines.push('  HID/input device: kernel lines can identify keyboard, mouse, consumer-control, system-control, and hidraw functions.');
     lines.push('  For stable matching, prefer ID_PATH/DEVPATH over event numbers because /dev/input/eventN can change after replug.');
   } else if (/root hub/i.test(d.name)) {
@@ -2134,7 +2227,7 @@ function render() {
 
   const d = selectedDevice();
   const details = detailLines(d);
-  const tabLine = tabs.map((t,i) => i === state.tab ? `[${t}]` : ` ${t} `).join('  ');
+  const tabLine = tabs.map((t, i) => i === state.tab ? `[${t}]` : ` ${t} `).join('  ');
   const detailHead = `${tabLine}`;
   const detailBody = wrapDetailLines([detailHead, '─'.repeat(rightW), ...details], rightW).slice(state.detailScroll, state.detailScroll + height);
 
@@ -2199,7 +2292,7 @@ function cleanup() {
   if (didCleanup) return;
   didCleanup = true;
   if (state.sniff && state.sniff.fd !== null && state.sniff.fd !== undefined) {
-    try { fs.closeSync(state.sniff.fd); } catch {}
+    try { fs.closeSync(state.sniff.fd); } catch { }
     state.sniff.fd = null;
     state.sniff.active = false;
   }
@@ -2219,10 +2312,10 @@ function handleInput(buf) {
   if (s === '\u0003' || s === 'q') { cleanup(); process.exit(0); }
   if (s === 'r' || s === 'R') { poll(true); return; }
   if (s === 'k' || s === 'K') { state.showKeys = !state.showKeys; render(); return; }
-  if (s === 'o' || s === 'O') { if (state.tab !== 5) state.tab = 5; toggleSniffer(); return; }
-  if (s === '[') { if (state.tab !== 5) state.tab = 5; cycleSniffTarget(-1); return; }
-  if (s === ']') { if (state.tab !== 5) state.tab = 5; cycleSniffTarget(1); return; }
-  if (s === 'm' || s === 'M') { if (state.tab !== 5) state.tab = 5; cycleSniffViewMode(); return; }
+  if (s === 'o' || s === 'O') { if (state.tab !== RAW_USB) state.tab = RAW_USB; toggleSniffer(); return; }
+  if (s === '[') { if (state.tab !== RAW_USB) state.tab = RAW_USB; cycleSniffTarget(-1); return; }
+  if (s === ']') { if (state.tab !== RAW_USB) state.tab = RAW_USB; cycleSniffTarget(1); return; }
+  if (s === 'm' || s === 'M') { if (state.tab !== RAW_USB) state.tab = RAW_USB; cycleSniffViewMode(); return; }
   if (s === 'j' || s === '\x1b[B') { selectDelta(1); return; }
   if (s === '\x1b[A') { selectDelta(-1); return; }
   if (s === '\x1b[C') { setTab(state.tab + 1); return; }
