@@ -30,7 +30,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const APP_VERSION = 'v20260608.18';
+const APP_VERSION = 'v20260608.19';
 const APP_TITLE = `USB Detective ${APP_VERSION}`;
 
 // Heavy handle detection can walk /proc and run lsof/fuser.
@@ -127,6 +127,7 @@ let state = {
   devices: [], rows: [], selectedKey: null, selectedRowKey: null, selectedIndex: 0, detailScroll: 0, leftScroll: 0, tab: 0,
   previousKeys: new Set(), addedUntil: new Map(), removedUntil: new Map(), removedDevices: new Map(),
   lastKernel: [], status: 'Starting...', lastSignature: '', needsRender: true, polling: false,
+  scanCounter: 0, scanStartedAt: null, scanReason: '',
   leftRowMap: new Map(), lastPollAt: null,
   sniff: { fd: null, path: '', kind: '', active: false, opening: false, lines: [], bytes: 0, reads: 0, error: '', failPath: '', targetIndex: 0, viewMode: 'smart', partial: Buffer.alloc(0) }
 };
@@ -1206,9 +1207,24 @@ function signature(snap) {
     size: termSize()
   });
 }
-async function poll(force = false) {
-  if (state.polling) return;
+async function poll(force = false, reason = 'refresh') {
+  if (state.polling) {
+    const runningFor = state.scanStartedAt ? Math.round((Date.now() - state.scanStartedAt) / 1000) : 0;
+    state.status = `Rescan already running${runningFor ? ` (${runningFor}s)` : ''} — please wait`;
+    render();
+    return;
+  }
+
+  const scanId = ++state.scanCounter;
+  const started = Date.now();
+  state.scanStartedAt = started;
+  state.scanReason = reason;
   state.polling = true;
+
+  const priorActive = state.devices.filter(d => !d.removed).length;
+  state.status = `Rescanning USB devices... ${reason} scan #${scanId}${priorActive ? `  |  previous active devices: ${priorActive}` : ''}`;
+  render();
+
   try {
     const snap = await collectSnapshot();
     updateHighlights(snap.devices);
@@ -1228,14 +1244,30 @@ async function poll(force = false) {
         state.selectedRowKey = state.selectedKey;
       }
     }
+
+    const activeCount = snap.devices.length;
+    const removedCount = state.removedDevices.size;
+    const addedCount = state.addedUntil.size;
+    const elapsedMs = Date.now() - started;
     const mode = POLL_MS > 0 ? `polling every ${POLL_MS}ms` : 'manual refresh mode';
-    state.status = `Updated ${snap.when.toLocaleTimeString()}  |  ${snap.devices.length} active USB devices  |  ${mode}`;
+    const changeBits = [];
+    if (addedCount) changeBits.push(`${addedCount} new`);
+    if (removedCount) changeBits.push(`${removedCount} recently removed`);
+    const changeText = changeBits.length ? `  |  ${changeBits.join(', ')}` : '  |  no hotplug changes';
+    state.status = `Rescan complete ${snap.when.toLocaleTimeString()}  |  ${activeCount} active USB devices${changeText}  |  ${elapsedMs}ms  |  ${mode}`;
+
     const sig = signature(snap);
     if (force || sig !== state.lastSignature) { state.lastSignature = sig; render(); }
+    else render();
   } catch (e) {
-    state.status = `Error: ${e.message || e}`;
+    const elapsedMs = Date.now() - started;
+    state.status = `Rescan failed after ${elapsedMs}ms: ${e.message || e}`;
     render();
-  } finally { state.polling = false; }
+  } finally {
+    state.polling = false;
+    state.scanStartedAt = null;
+    state.scanReason = '';
+  }
 }
 function selectedDevice() { return state.devices.find(d => d.key === state.selectedKey) || state.devices[0] || null; }
 function deviceLabel(d) {
@@ -2433,7 +2465,7 @@ function handleInput(buf) {
   if (/\x1b\[<\d+;\d+;\d+[mM]/.test(s)) return;
 
   if (s === '\u0003' || s === 'q') { cleanup(); process.exit(0); }
-  if (s === 'r' || s === 'R') { poll(true); return; }
+  if (s === 'r' || s === 'R') { poll(true, 'manual'); return; }
   if (s === 'k' || s === 'K') { state.showKeys = !state.showKeys; render(); return; }
   if (s === 'o' || s === 'O') { if (state.tab !== RAW_USB) state.tab = RAW_USB; toggleSniffer(); return; }
   if (s === '[') { if (state.tab !== RAW_USB) state.tab = RAW_USB; cycleSniffTarget(-1); return; }
@@ -2468,13 +2500,13 @@ async function main() {
 
   enterTuiScreen();
   render();
-  await poll(true);
+  await poll(true, 'startup');
 
   // No background topology/handle polling unless explicitly enabled.
   // The expensive part is collectSnapshot(): lsusb, udevadm, lsblk, dmesg,
   // v4l2-ctl, lsof/fuser, and /proc fd walks for each discovered /dev node.
   // Press r/R for an explicit rescan, or set USB_DETECTIVE_POLL_MS to restore polling.
-  if (POLL_MS > 0) setInterval(() => poll(false), POLL_MS);
+  if (POLL_MS > 0) setInterval(() => poll(false, 'background'), POLL_MS);
 
   // Cheap UI-only timer for expiring green/red hotplug highlights. Disabled
   // after the highlight windows are gone, so idle means idle.
